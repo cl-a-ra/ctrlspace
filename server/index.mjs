@@ -99,7 +99,9 @@ function getSession(request) {
 function appJwt(config) {
   const now = Math.floor(Date.now() / 1000)
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString('base64url')
-  const unsigned = `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode({ iat: now - 60, exp: now + 540, iss: config.appId })}`
+  // Keep the JWT valid with modest local clock drift while staying within GitHub's 10-minute limit.
+  const claims = { iat: now - 300, exp: now + 300, iss: config.appId }
+  const unsigned = `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode(claims)}`
   const signer = createSign('RSA-SHA256')
   signer.update(unsigned)
   signer.end()
