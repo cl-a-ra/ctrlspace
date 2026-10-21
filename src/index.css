@@ -1,5 +1,5 @@
 :root {
-  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-family: var(--font-ui);
   color: var(--text-primary);
   background: #0b0c13;
   font-synthesis: none;
@@ -19,6 +19,21 @@
   --text-secondary: #a7a5b5;
   --text-subtle: #858796;
   --accent: #a58aff;
+  --font-ui: 'Segoe UI', system-ui, sans-serif;
+  --font-display: var(--font-ui);
+  --font-mono: 'Cascadia Code', Consolas, monospace;
+}
+
+:root[data-font='code'] {
+  --font-ui: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+  --font-display: var(--font-ui);
+  --font-mono: var(--font-ui);
+}
+
+:root[data-font='terminal'] {
+  --font-ui: Consolas, 'Cascadia Mono', 'Courier New', monospace;
+  --font-display: var(--font-ui);
+  --font-mono: var(--font-ui);
 }
 
 :root[data-theme='light'] {
@@ -43,8 +58,6 @@
 #root {
   min-height: 100vh;
   background: var(--background);
-  --font-display: 'Segoe UI', system-ui, sans-serif;
-  --font-mono: 'Cascadia Code', Consolas, monospace;
 }
 
 * {
@@ -52,14 +65,14 @@
 }
 
 html {
-  min-width: 320px;
+  min-width: 0;
   min-height: 100%;
   background: var(--background);
   scroll-behavior: smooth;
 }
 
 body {
-  min-width: 320px;
+  min-width: 0;
   min-height: 100vh;
   margin: 0;
 }

@@ -1,6 +1,9 @@
 import { createSign, randomBytes } from 'node:crypto'
+import { lookup as dnsLookup } from 'node:dns/promises'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
-import { createServer } from 'node:http'
+import { request as httpRequest, createServer } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { isIP } from 'node:net'
 import { extname, resolve, sep } from 'node:path'
 
 function loadEnvironmentFile() {
@@ -180,6 +183,158 @@ async function readJsonBody(request) {
   }
 }
 
+function isPublicIpv4(address) {
+  const octets = address.split('.').map(Number)
+  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return false
+  const [first, second, third] = octets
+  return !(first === 0
+    || first === 10
+    || first === 127
+    || (first === 100 && second >= 64 && second <= 127)
+    || (first === 169 && second === 254)
+    || (first === 172 && second >= 16 && second <= 31)
+    || (first === 192 && second === 0 && (third === 0 || third === 2))
+    || (first === 192 && second === 88 && third === 99)
+    || (first === 192 && second === 168)
+    || (first === 198 && (second === 18 || second === 19 || (second === 51 && third === 100)))
+    || (first === 203 && second === 0 && third === 113)
+    || first >= 224)
+}
+
+async function publicIpv4Address(target) {
+  if ((target.protocol !== 'http:' && target.protocol !== 'https:')
+    || target.username || target.password
+    || (target.port && target.port !== '80' && target.port !== '443')) {
+    throw new Error('Use a public website URL with no credentials or custom port.')
+  }
+  const hostname = target.hostname.replace(/^\[|\]$/g, '')
+  const ipVersion = isIP(hostname)
+  const addresses = ipVersion === 4
+    ? [{ address: hostname, family: 4 }]
+    : ipVersion === 6
+      ? []
+      : await dnsLookup(hostname, { all: true, verbatim: true })
+  const address = addresses.find((entry) => entry.family === 4 && isPublicIpv4(entry.address))
+  if (!address) throw new Error('This website does not resolve to a public IPv4 address.')
+  return address
+}
+
+function requestWebsite(target, address, { headers, method = 'GET' }) {
+  return new Promise((resolveResponse, rejectResponse) => {
+    const requester = target.protocol === 'https:' ? httpsRequest : httpRequest
+    const req = requester(target, {
+      method,
+      headers,
+      lookup: (_hostname, options, callback) => {
+        if (options.all) callback(null, [address])
+        else callback(null, address.address, address.family)
+      },
+    }, (response) => resolveResponse(response))
+    req.setTimeout(5000, () => req.destroy(new Error('The website request timed out.')))
+    req.on('error', rejectResponse)
+    req.end()
+  })
+}
+
+function decodeHtmlText(value) {
+  return value.replace(/&#(x[0-9a-f]+|\d+);?|&(amp|lt|gt|quot|apos|nbsp);/gi, (entity, numeric, named) => {
+    if (numeric) {
+      const hex = numeric[0].toLowerCase() === 'x'
+      const code = Number.parseInt(hex ? numeric.slice(1) : numeric, hex ? 16 : 10)
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : ''
+    }
+    return ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' })[named.toLowerCase()]
+  }).replace(/\s+/g, ' ').trim()
+}
+
+function pageTitleFromHtml(html) {
+  const metaTags = html.match(/<meta\b[^>]*>/gi) ?? []
+  for (const tag of metaTags) {
+    const property = tag.match(/\b(?:property|name)\s*=\s*["'](?:og:title|twitter:title)["']/i)
+    if (!property) continue
+    const content = tag.match(/\bcontent\s*=\s*(["'])(.*?)\1/i)?.[2]
+    const title = content ? decodeHtmlText(content) : ''
+    if (title) return title.slice(0, 200)
+  }
+  const title = html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1]
+  const cleanTitle = title ? decodeHtmlText(title.replace(/<[^>]*>/g, '')) : ''
+  return cleanTitle ? cleanTitle.slice(0, 200) : null
+}
+
+async function fetchWebsiteTitle(inputUrl, redirectsRemaining = 3) {
+  const target = new URL(inputUrl)
+  const address = await publicIpv4Address(target)
+  const response = await requestWebsite(target, address, {
+    headers: { Accept: 'text/html', 'User-Agent': 'CTRLSPACE website metadata lookup' },
+  })
+  const status = response.statusCode ?? 0
+  if ([301, 302, 303, 307, 308].includes(status) && response.headers.location) {
+    response.resume()
+    if (redirectsRemaining === 0) throw new Error('The website redirected too many times.')
+    const nextUrl = new URL(response.headers.location, target)
+    return fetchWebsiteTitle(nextUrl.toString(), redirectsRemaining - 1)
+  }
+  if (status < 200 || status >= 300) {
+    response.resume()
+    throw new Error(`The website returned HTTP ${status}.`)
+  }
+  if (!response.headers['content-type']?.toLowerCase().includes('text/html')) {
+    response.resume()
+    throw new Error('The website did not return an HTML page.')
+  }
+
+  const chunks = []
+  let length = 0
+  for await (const chunk of response) {
+    length += chunk.length
+    if (length > 1024 * 1024) {
+      response.destroy()
+      throw new Error('The website page is too large to inspect safely.')
+    }
+    chunks.push(chunk)
+  }
+  return pageTitleFromHtml(Buffer.concat(chunks).toString('utf8'))
+}
+
+async function checkWebsite(inputUrl, redirectsRemaining = 3) {
+  const target = new URL(inputUrl)
+  const address = await publicIpv4Address(target)
+  const startedAt = performance.now()
+  let response
+  try {
+    response = await requestWebsite(target, address, {
+      headers: {
+        Accept: '*/*',
+        Range: 'bytes=0-0',
+        'User-Agent': 'CTRLSPACE website health check',
+      },
+    })
+  } catch (error) {
+    const networkErrorCodes = ['ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'ETIMEDOUT', 'EAI_AGAIN']
+    if (networkErrorCodes.includes(error.code)) {
+      return { status: 'offline', statusCode: null, latencyMs: Math.round(performance.now() - startedAt), detail: error.message }
+    }
+    throw error
+  }
+
+  const statusCode = response.statusCode ?? 0
+  const latencyMs = Math.round(performance.now() - startedAt)
+  if ([301, 302, 303, 307, 308].includes(statusCode) && response.headers.location) {
+    response.destroy()
+    if (redirectsRemaining === 0) throw new Error('The website redirected too many times.')
+    const nextUrl = new URL(response.headers.location, target)
+    return checkWebsite(nextUrl.toString(), redirectsRemaining - 1)
+  }
+  response.destroy()
+  const status = statusCode >= 200 && statusCode < 400 ? 'online' : 'degraded'
+  return {
+    status,
+    statusCode,
+    latencyMs,
+    detail: `HTTP ${statusCode}`,
+  }
+}
+
 function sendAppPage(request, response, pathname) {
   const root = resolve('dist')
   const decoded = decodeURIComponent(pathname)
@@ -216,6 +371,66 @@ function sendAppPage(request, response, pathname) {
 
 async function handleApi(request, response, url) {
   const config = githubAppConfig()
+  if (request.method === 'POST' && url.pathname === '/api/website/metadata') {
+    try {
+      validateOrigin(request)
+    } catch (error) {
+      return sendJson(response, 403, { error: error.message })
+    }
+    let body
+    try {
+      body = await readJsonBody(request)
+    } catch (error) {
+      return sendJson(response, 400, { error: error.message })
+    }
+    const inputUrl = typeof body === 'object' && body !== null && typeof body.url === 'string' ? body.url : ''
+    let parsedUrl
+    try {
+      parsedUrl = new URL(inputUrl)
+    } catch {
+      return sendJson(response, 400, { error: 'Enter a valid website URL.' })
+    }
+    if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+      return sendJson(response, 400, { error: 'Only http:// and https:// website addresses are supported.' })
+    }
+    try {
+      return sendJson(response, 200, { title: await fetchWebsiteTitle(parsedUrl.toString()) })
+    } catch (error) {
+      console.error('Website metadata could not be retrieved.', error)
+      return sendJson(response, 502, { error: error.message })
+    }
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/website/check') {
+    try {
+      validateOrigin(request)
+    } catch (error) {
+      return sendJson(response, 403, { error: error.message })
+    }
+    let body
+    try {
+      body = await readJsonBody(request)
+    } catch (error) {
+      return sendJson(response, 400, { error: error.message })
+    }
+    const inputUrl = typeof body === 'object' && body !== null && typeof body.url === 'string' ? body.url : ''
+    let parsedUrl
+    try {
+      parsedUrl = new URL(inputUrl)
+    } catch {
+      return sendJson(response, 400, { error: 'Enter a valid website URL.' })
+    }
+    if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+      return sendJson(response, 400, { error: 'Only http:// and https:// website addresses are supported.' })
+    }
+    try {
+      return sendJson(response, 200, await checkWebsite(parsedUrl.toString()))
+    } catch (error) {
+      console.error('Website health check could not be completed.', error)
+      return sendJson(response, 502, { error: error.message })
+    }
+  }
+
   if (request.method === 'GET' && url.pathname === '/api/github/status') {
     return sendJson(response, 200, { configured: Boolean(config), connected: Boolean(getSession(request)) })
   }
@@ -320,7 +535,7 @@ async function handleApi(request, response, url) {
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url ?? '/', appBase)
-    if (url.pathname.startsWith('/api/github/')) {
+    if (url.pathname.startsWith('/api/github/') || url.pathname.startsWith('/api/website/')) {
       return await handleApi(request, response, url)
     }
     if (isProduction && (request.method === 'GET' || request.method === 'HEAD')) {
