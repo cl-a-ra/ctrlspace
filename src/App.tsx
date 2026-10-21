@@ -74,7 +74,16 @@ type WorkspaceActivity = {
 }
 type View = 'overview' | 'applications' | 'projects' | 'activity' | 'settings'
 type ThemePreference = 'system' | 'light' | 'dark'
+type AccentPreference = 'nebula' | 'cyber' | 'matrix' | 'arctic' | 'ember' | 'synthwave'
 type FontPreference = 'system' | 'code' | 'terminal'
+const accentPalettes: { id: AccentPreference; name: string; color: string }[] = [
+  { id: 'nebula', name: 'Nebula violet', color: '#a58aff' },
+  { id: 'cyber', name: 'Cyber cyan', color: '#32d9ff' },
+  { id: 'matrix', name: 'Matrix green', color: '#6ee787' },
+  { id: 'arctic', name: 'Arctic blue', color: '#62a6ff' },
+  { id: 'ember', name: 'Solar ember', color: '#ff9e64' },
+  { id: 'synthwave', name: 'Synthwave pink', color: '#ff68c8' },
+]
 type SearchResult = {
   id: string
   type: 'application' | 'project' | 'task' | 'bug'
@@ -486,6 +495,14 @@ function loadFontPreference(): FontPreference {
   return 'system'
 }
 
+function loadAccentPreference(): AccentPreference {
+  const stored = window.localStorage.getItem('ctrlspace.accent.v1')
+  const savedPalette = accentPalettes.find((palette) => palette.id === stored)
+  if (savedPalette) return savedPalette.id
+  if (stored !== null) console.error('Saved CTRLSPACE color scheme has an unexpected value.')
+  return 'nebula'
+}
+
 function loadLocalDisplayName() {
   const stored = window.localStorage.getItem('ctrlspace.display-name.v1')?.trim()
   return stored ? stored.slice(0, 60) : 'Clara K.'
@@ -496,6 +513,7 @@ function App() {
     new URLSearchParams(window.location.search).get('import') === '1' ? 'applications' : 'overview',
   )
   const [themePreference, setThemePreference] = useState<ThemePreference>(loadThemePreference)
+  const [accentPreference, setAccentPreference] = useState<AccentPreference>(loadAccentPreference)
   const [fontPreference, setFontPreference] = useState<FontPreference>(loadFontPreference)
   const [localDisplayName, setLocalDisplayName] = useState(loadLocalDisplayName)
   const [displayNameDraft, setDisplayNameDraft] = useState(loadLocalDisplayName)
@@ -655,6 +673,11 @@ function App() {
     document.documentElement.dataset.font = fontPreference
     window.localStorage.setItem('ctrlspace.font.v1', fontPreference)
   }, [fontPreference])
+
+  useEffect(() => {
+    document.documentElement.dataset.accent = accentPreference
+    window.localStorage.setItem('ctrlspace.accent.v1', accentPreference)
+  }, [accentPreference])
 
   useEffect(() => {
     let timer: number
@@ -1557,6 +1580,7 @@ function App() {
       projects,
       activity: activities,
       themePreference,
+      accentPreference,
       fontPreference,
     }
     const objectUrl = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' }))
@@ -1755,7 +1779,7 @@ function App() {
               <section className="welcome-row">
                 <div>
                   <div className="eyebrow"><span className="eyebrow-line" /> {todayLabel}</div>
-                  <h1>{greeting}, {profileName.split(/[\s@.]+/).filter(Boolean)[0] ?? 'there'} <span className="wave">✳</span></h1>
+                  <h1>{greeting}, {profileName.split(/[\s@.]+/).filter(Boolean)[0] ?? 'there'} <span className="wave" aria-hidden="true">💻</span></h1>
                   <p className="welcome-subtitle">Your digital workspace, all in one place.</p>
                 </div>
                 <button className="primary-button" onClick={() => setIsAddOpen(true)}><Icon name="plus" size={17} /> Add application</button>
@@ -2056,6 +2080,22 @@ function App() {
                   <p>Choose a fixed theme or follow your device setting.</p>
                   <div className="settings-theme-options" role="group" aria-label="Theme preference">
                     {(['system', 'light', 'dark'] as const).map((preference) => <button key={preference} type="button" className={themePreference === preference ? 'selected' : ''} aria-pressed={themePreference === preference} onClick={() => setThemePreference(preference)}>{preference[0].toUpperCase() + preference.slice(1)}</button>)}
+                  </div>
+                  <h2 className="settings-font-heading">Color scheme</h2>
+                  <p>Pick a tech-inspired accent palette for controls, highlights, and focus states.</p>
+                  <div className="settings-palette-options" role="group" aria-label="Color scheme">
+                    {accentPalettes.map((palette) => (
+                      <button
+                        key={palette.id}
+                        type="button"
+                        className={accentPreference === palette.id ? 'selected' : ''}
+                        aria-pressed={accentPreference === palette.id}
+                        onClick={() => setAccentPreference(palette.id)}
+                      >
+                        <span className="settings-palette-swatch" style={{ backgroundColor: palette.color }} />
+                        {palette.name}
+                      </button>
+                    ))}
                   </div>
                   <h2 className="settings-font-heading">Interface font</h2>
                   <p>Choose a readable system face or a code-inspired monospace style.</p>
