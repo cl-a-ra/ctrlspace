@@ -1,0 +1,20 @@
+{
+  "id": "/",
+  "name": "CTRLSPACE — Digital Operations Hub",
+  "short_name": "CTRLSPACE",
+  "description": "Your applications, projects, and digital workspace in one place.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0c13",
+  "theme_color": "#0b0c13",
+  "icons": [
+    {
+      "src": "/ctrlspace-mark.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

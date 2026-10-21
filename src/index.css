@@ -1,0 +1,81 @@
+:root {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  color: var(--text-primary);
+  background: #0b0c13;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-optical-sizing: auto;
+  color-scheme: dark;
+  --background: #0b0c13;
+  --line: #252733;
+  --text-primary: #eeecf5;
+  --text-muted: #77798a;
+  --surface: #14151f;
+  --surface-raised: #101119;
+  --surface-hover: #1a1b26;
+  --surface-border: #30313e;
+  --text-secondary: #a7a5b5;
+  --text-subtle: #858796;
+  --accent: #a58aff;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --background: #f5f6fa;
+  --line: #e1e4ec;
+  --text-primary: #202435;
+  --text-muted: #657084;
+  --surface: #ffffff;
+  --surface-raised: #f8f9fc;
+  --surface-hover: #eceef5;
+  --surface-border: #d8dce7;
+  --text-secondary: #465065;
+  --text-subtle: #667186;
+  --accent: #6048b2;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+#root {
+  min-height: 100vh;
+  background: var(--background);
+  --font-display: 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'Cascadia Code', Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: var(--background);
+  scroll-behavior: smooth;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: .6;
+}
+
+::selection {
+  color: #fff;
+  background: #6752a7;
+}
