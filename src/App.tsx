@@ -72,7 +72,7 @@ type WorkspaceActivity = {
   detail: string
   createdAt: string
 }
-type View = 'overview' | 'applications' | 'projects' | 'activity' | 'settings'
+type View = 'overview' | 'business-portal' | 'developer-portal' | 'platform-admin' | 'applications' | 'projects' | 'activity' | 'settings'
 type ThemePreference = 'system' | 'light' | 'dark'
 type AccentPreference = 'nebula' | 'cyber' | 'matrix' | 'arctic' | 'ember' | 'synthwave'
 type FontPreference = 'system' | 'code' | 'terminal'
@@ -144,13 +144,6 @@ const initialApps: AppRecord[] = [
 
 const projectColors = ['violet', 'blue', 'mint']
 
-const navItems: { id: View; label: string; icon: string }[] = [
-  { id: 'overview', label: 'Overview', icon: 'grid' },
-  { id: 'applications', label: 'Applications', icon: 'layers' },
-  { id: 'projects', label: 'Projects', icon: 'folder' },
-  { id: 'activity', label: 'Activity', icon: 'pulse' },
-]
-
 function isAppRecord(value: unknown): value is AppRecord {
   if (typeof value !== 'object' || value === null) return false
   const record = value as Record<string, unknown>
@@ -209,6 +202,8 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
     settings: <><circle cx="12" cy="12" r="3" /><path d="m19.4 15 .1.1 1.2 1-1.5 2.6-1.5-.5a8 8 0 0 1-1.7 1l-.3 1.6h-3l-.3-1.6a8 8 0 0 1-1.7-1l-1.5.5-1.5-2.6 1.2-1a7 7 0 0 1 0-2l-1.2-1 1.5-2.6 1.5.5a8 8 0 0 1 1.7-1l.3-1.6h3l.3 1.6a8 8 0 0 1 1.7 1l1.5-.5 1.5 2.6-1.2 1a7 7 0 0 1 0 2Z" /></>,
     spark: <><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z" /><path d="m19 15 .9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9L19 15Z" /></>,
     check: <path d="m5 12 4 4L19 6" />,
+    info: <><circle cx="12" cy="12" r="9" /><path d="M12 11v5M12 8h.01" /></>,
+    lock: <><rect x="4" y="10" width="16" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>,
   }
 
   return (
@@ -512,6 +507,9 @@ function App() {
   const [currentView, setCurrentView] = useState<View>(() =>
     new URLSearchParams(window.location.search).get('import') === '1' ? 'applications' : 'overview',
   )
+  const [lastActivePortal, setLastActivePortal] = useState<'Personal' | 'Business' | 'Developer' | 'Platform admin'>(
+    currentView === 'applications' ? 'Business' : 'Personal',
+  )
   const [themePreference, setThemePreference] = useState<ThemePreference>(loadThemePreference)
   const [accentPreference, setAccentPreference] = useState<AccentPreference>(loadAccentPreference)
   const [fontPreference, setFontPreference] = useState<FontPreference>(loadFontPreference)
@@ -524,6 +522,10 @@ function App() {
   const [authLoading, setAuthLoading] = useState(supabaseConfigStatus !== 'missing')
   const [workspaceOwnerId, setWorkspaceOwnerId] = useState<string | null>(null)
   const [authError, setAuthError] = useState('')
+  const [authMessage, setAuthMessage] = useState('')
+  const [passwordRecovery, setPasswordRecovery] = useState(() =>
+    new URLSearchParams(window.location.hash.slice(1)).get('type') === 'recovery',
+  )
   const [today, setToday] = useState(() => localDateKey(new Date()))
   const [activities, setActivities] = useState<WorkspaceActivity[]>(loadActivity)
   const [activityFilter, setActivityFilter] = useState<'all' | ActivityCategory>('all')
@@ -540,6 +542,7 @@ function App() {
   )
   const [isCollectionOpen, setIsCollectionOpen] = useState(false)
   const [isProjectOpen, setIsProjectOpen] = useState(false)
+
   const [isTaskOpen, setIsTaskOpen] = useState(false)
   const [isBugOpen, setIsBugOpen] = useState(false)
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null)
@@ -629,8 +632,9 @@ function App() {
       return
     }
     let active = true
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (!active) return
+      if (event === 'PASSWORD_RECOVERY') setPasswordRecovery(true)
       acceptAuthUser(session?.user ?? null)
       setAuthLoading(false)
     })
@@ -1534,14 +1538,79 @@ function App() {
   async function signInWithGoogle() {
     if (!supabase) return
     setAuthError('')
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: 'google',
-      options: { redirectTo: window.location.origin },
+    setAuthMessage('')
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: { redirectTo: window.location.origin },
+      })
+      if (error) {
+        console.error('Google sign-in could not be started.', error)
+        setAuthError('Google sign-in could not be started. Check the Supabase Google provider settings and try again.')
+      }
+    } catch (error) {
+      console.error('Google sign-in request failed.', error)
+      setAuthError('Google sign-in could not be started. Check your connection and try again.')
+    }
+  }
+
+  async function signInWithEmail(email: string, password: string) {
+    if (!supabase) return
+    setAuthError('')
+    setAuthMessage('')
+    const { error } = await supabase.auth.signInWithPassword({ email, password })
+    if (error) {
+      console.error('Email sign-in failed.', error)
+      setAuthError(error.message)
+    }
+  }
+
+  async function createEmailAccount(email: string, password: string) {
+    if (!supabase) return
+    setAuthError('')
+    setAuthMessage('')
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: { emailRedirectTo: window.location.origin },
     })
     if (error) {
-      console.error('Google sign-in could not be started.', error)
-      setAuthError('Google sign-in could not be started. Check the Supabase Google provider settings and try again.')
+      console.error('Email account creation failed.', error)
+      setAuthError(error.message)
+      return
     }
+    if (!data.session) {
+      setAuthMessage('Account created. Check your email for a confirmation link before signing in.')
+    }
+  }
+
+  async function sendPasswordRecovery(email: string) {
+    if (!supabase) return
+    setAuthError('')
+    setAuthMessage('')
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin,
+    })
+    if (error) {
+      console.error('Password recovery email could not be sent.', error)
+      setAuthError('Could not send the recovery email. Check your address and Supabase email settings, then try again.')
+      return
+    }
+    setAuthMessage('If an account exists for that address, a password recovery link has been sent.')
+  }
+
+  async function updateRecoveredPassword(password: string) {
+    if (!supabase) return
+    setAuthError('')
+    setAuthMessage('')
+    const { error } = await supabase.auth.updateUser({ password })
+    if (error) {
+      console.error('The account password could not be updated.', error)
+      setAuthError(error.message)
+      return
+    }
+    setPasswordRecovery(false)
+    setAuthMessage('Password updated. You are signed in.')
   }
 
   async function signOut() {
@@ -1597,12 +1666,52 @@ function App() {
   const profileInitials = profileName.split(/[\s@.]+/).filter(Boolean).slice(0, 2).map((part) => part[0].toUpperCase()).join('')
   const pageTitle = {
     overview: 'Overview',
+    'business-portal': 'Business Portal',
+    'developer-portal': 'Developer Portal',
+    'platform-admin': 'Platform Admin',
     applications: 'Applications',
     projects: 'Projects',
     activity: 'Activity',
     settings: 'Settings',
   }[currentView]
-  const activePortal = currentView === 'applications' ? 'Business' : currentView === 'projects' ? 'Developer' : 'Personal'
+  const activePortal = currentView === 'business-portal' || currentView === 'applications'
+    ? 'Business'
+    : currentView === 'developer-portal' || currentView === 'projects'
+      ? 'Developer'
+      : currentView === 'platform-admin'
+        ? 'Platform admin'
+        : currentView === 'overview'
+          ? 'Personal'
+          : lastActivePortal
+  const portalHomeView: View = activePortal === 'Business'
+    ? 'business-portal'
+    : activePortal === 'Developer'
+      ? 'developer-portal'
+      : activePortal === 'Platform admin'
+        ? 'platform-admin'
+        : 'overview'
+  const navItems: { id: View; label: string; icon: string }[] = [
+    { id: portalHomeView, label: activePortal === 'Personal' ? 'Overview' : 'Portal dashboard', icon: 'grid' },
+    ...(activePortal === 'Developer'
+      ? [
+          { id: 'projects' as const, label: 'Projects', icon: 'folder' },
+          { id: 'applications' as const, label: 'Applications', icon: 'layers' },
+        ]
+      : [
+          { id: 'applications' as const, label: 'Applications', icon: 'layers' },
+          { id: 'projects' as const, label: 'Projects', icon: 'folder' },
+        ]),
+    { id: 'activity', label: 'Activity', icon: 'pulse' },
+  ]
+  const openDeveloperTasks = projects.flatMap((project) => project.tasks
+    .filter((task) => task.status !== 'done')
+    .map((task) => ({ ...task, projectId: project.id, projectName: project.name })))
+  const openDeveloperBugs = projects.flatMap((project) => project.bugs
+    .filter((bug) => bug.status !== 'resolved')
+    .map((bug) => ({ ...bug, projectId: project.id, projectName: project.name })))
+  const completedDeveloperTasks = projects.reduce((total, project) =>
+    total + project.tasks.filter((task) => task.status === 'done').length, 0)
+  const totalDeveloperTasks = projects.reduce((total, project) => total + project.tasks.length, 0)
   const todayLabel = new Intl.DateTimeFormat(undefined, {
     weekday: 'long',
     month: 'long',
@@ -1616,14 +1725,15 @@ function App() {
     return <AuthGate error="Supabase is only partially configured. Set both VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in .env." />
   }
   if (supabase && authLoading) return <AuthGate loading />
+  if (supabase && passwordRecovery && authUser) return <AuthGate mode="update-password" error={authError} message={authMessage} onUpdatePassword={updateRecoveredPassword} />
   if (supabase && authUser && authError) return <AuthGate error={authError} onSignOut={signOut} />
-  if (supabase && !authUser) return <AuthGate error={authError} onSignIn={signInWithGoogle} />
+  if (supabase && !authUser) return <AuthGate error={authError} message={authMessage} onSignIn={signInWithGoogle} onEmailSignIn={signInWithEmail} onCreateAccount={createEmailAccount} onRecoverPassword={sendPasswordRecovery} />
   if (supabase && authUser && workspaceOwnerId !== authUser.id) return <AuthGate loading />
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setCurrentView('overview') }} aria-label="CTRLSPACE home">
+        <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setCurrentView(portalHomeView); setActiveProjectId(null) }} aria-label="CTRLSPACE home">
           <img className="brand-logo" src="/ctrlspace-mark.png" alt="" />
           <span className="brand-name">CTRL<span>SPACE</span></span>
         </a>
@@ -1648,23 +1758,20 @@ function App() {
         <div className="portal-nav" aria-label="Portal selector">
           {([
             { label: 'Personal', view: 'overview' as const },
-            { label: 'Business', view: 'applications' as const },
-            { label: 'Developer', view: 'projects' as const },
-          ]).map((item, index) => (
+            { label: 'Business', view: 'business-portal' as const },
+            { label: 'Developer', view: 'developer-portal' as const },
+            { label: 'Platform admin', view: 'platform-admin' as const },
+          ] as const).map((item, index) => (
             <button key={item.label} className={`portal-item ${activePortal === item.label ? 'selected' : ''}`} onClick={() => {
+              setLastActivePortal(item.label)
               setCurrentView(item.view)
-              if (item.view !== 'projects') setActiveProjectId(null)
+              setActiveProjectId(null)
             }} aria-current={activePortal === item.label ? 'page' : undefined}>
               <span className={`portal-dot portal-dot-${index}`} />
               {item.label}
               {activePortal === item.label && <span className="portal-current">CURRENT</span>}
             </button>
           ))}
-          <button className="portal-item" disabled title="Platform administration is planned for a later phase">
-            <span className="portal-dot" />
-            Platform admin
-            <span className="portal-current">PLANNED</span>
-          </button>
         </div>
 
         <div className="sidebar-bottom">
@@ -1774,6 +1881,82 @@ function App() {
         </header>
 
         <div className="page-content">
+          {currentView === 'business-portal' && (
+            <>
+              <section className="welcome-row compact-welcome">
+                <div><div className="eyebrow"><span className="eyebrow-line" /> ORGANIZATION OPERATIONS</div><h1>Business Portal</h1><p className="welcome-subtitle">A company-level view of the apps and delivery work in this workspace.</p></div>
+                <button className="primary-button" onClick={() => setIsAddOpen(true)}><Icon name="plus" size={17} /> Add app or website</button>
+              </section>
+              <div className="portal-notice"><Icon name="info" size={16} /><span><strong>Local workspace preview</strong> — inventory and project data are saved in this browser. Team membership, roles, shared documents, and organization-wide audit data require a configured shared backend.</span></div>
+              <section className="portal-metrics" aria-label="Business workspace summary">
+                <article className="portal-metric"><span>Tracked resources</span><strong>{apps.length}</strong><small>Apps and websites in this browser</small></article>
+                <article className="portal-metric"><span>Active projects</span><strong>{projects.length}</strong><small>Project workspaces on this device</small></article>
+                <article className="portal-metric"><span>Open bugs</span><strong>{openDeveloperBugs.length}</strong><small>Not yet resolved</small></article>
+                <article className="portal-metric"><span>Health checks</span><strong>{apps.filter((app) => app.lastCheckedAt).length}</strong><small>Resources checked at least once</small></article>
+              </section>
+              <div className="portal-dashboard-grid">
+                <section className="portal-panel">
+                  <div className="section-heading"><div><div className="section-kicker">WORKSPACE INVENTORY</div><h2>Workspace resources</h2></div><button className="text-button" onClick={() => setCurrentView('applications')}>Open library <Icon name="arrow" size={14} /></button></div>
+                  {apps.length ? <div className="portal-resource-list">{apps.slice(0, 6).map((app) => <div className="portal-resource-row" key={app.id}><span className="portal-resource-icon">{app.name.slice(0, 1).toUpperCase()}</span><span className="portal-resource-copy"><strong>{app.name}</strong><small>{app.url || app.category}</small></span><span className="portal-resource-state">{app.lastCheckedAt ? 'Checked' : 'Not checked'}</span></div>)}</div> : <p className="portal-empty">No resources yet. Add an app or website to start the inventory.</p>}
+                </section>
+                <section className="portal-panel">
+                  <div className="section-heading"><div><div className="section-kicker">DELIVERY OVERVIEW</div><h2>Project progress</h2></div><button className="text-button" onClick={() => setCurrentView('projects')}>View projects <Icon name="arrow" size={14} /></button></div>
+                  {projects.length ? <div className="portal-project-list">{projects.slice(0, 5).map((project) => {
+                    const done = project.tasks.filter((task) => task.status === 'done').length
+                    const progress = project.tasks.length ? Math.round(done / project.tasks.length * 100) : 0
+                    return <button className="portal-project-row" key={project.id} onClick={() => { setActiveProjectId(project.id); setCurrentView('projects') }}><span className="portal-project-copy"><strong>{project.name}</strong><small>{project.tasks.length} tasks · {project.bugs.filter((bug) => bug.status !== 'resolved').length} open bugs</small></span><span className="portal-progress"><span><i style={{ width: `${progress}%` }} /></span><small>{progress}%</small></span></button>
+                  })}</div> : <p className="portal-empty">No projects yet. Create one to track delivery progress.</p>}
+                </section>
+              </div>
+              <section className="portal-capabilities">
+                <div><span className="capability-status">NOT CONNECTED</span><strong>Team &amp; role management</strong><p>Invitations and role-based permissions are not available until server-side organization access is configured.</p></div>
+                <div><span className="capability-status">NOT CONNECTED</span><strong>Shared documents &amp; audit</strong><p>Secure document sharing and organization audit trails need shared storage and authenticated access.</p></div>
+                <div><span className="capability-status">NOT CONNECTED</span><strong>Organization analytics</strong><p>Company-wide usage and subscription analytics are not available from browser-local data.</p></div>
+              </section>
+              <footer className="page-footer"><span>CTRLSPACE <span className="footer-divider">/</span> BUSINESS OPERATIONS</span><span>Local workspace preview · not shared with a team</span></footer>
+            </>
+          )}
+
+          {currentView === 'developer-portal' && (
+            <>
+              <section className="welcome-row compact-welcome">
+                <div><div className="eyebrow"><span className="eyebrow-line" /> ENGINEERING WORKSPACE</div><h1>Developer Portal</h1><p className="welcome-subtitle">A focused view of project tasks, bugs, repositories, and delivery health.</p></div>
+                <button className="primary-button" onClick={() => setCurrentView('projects')}><Icon name="arrow" size={17} /> Open project workspace</button>
+              </section>
+              <div className="portal-notice"><Icon name="info" size={16} /><span><strong>Local project data</strong> — tasks and bugs shown here are stored in this browser. Assignments are labels, not authenticated team identities; repository automation and build pipelines are not connected.</span></div>
+              <section className="portal-metrics" aria-label="Developer workspace summary">
+                <article className="portal-metric"><span>Projects</span><strong>{projects.length}</strong><small>Available in this workspace</small></article>
+                <article className="portal-metric"><span>Open tasks</span><strong>{openDeveloperTasks.length}</strong><small>Across all local projects</small></article>
+                <article className="portal-metric"><span>Open bugs</span><strong>{openDeveloperBugs.length}</strong><small>Across all local projects</small></article>
+                <article className="portal-metric"><span>Task completion</span><strong>{totalDeveloperTasks ? `${Math.round(completedDeveloperTasks / totalDeveloperTasks * 100)}%` : '—'}</strong><small>{completedDeveloperTasks} of {totalDeveloperTasks} tasks complete</small></article>
+              </section>
+              <div className="portal-dashboard-grid">
+                <section className="portal-panel">
+                  <div className="section-heading"><div><div className="section-kicker">NEXT UP</div><h2>Open tasks</h2></div><button className="text-button" onClick={() => setCurrentView('projects')}>All projects <Icon name="arrow" size={14} /></button></div>
+                  {openDeveloperTasks.length ? <div className="portal-work-list">{openDeveloperTasks.slice(0, 7).map((task) => <button className="portal-work-row" key={`${task.projectId}-${task.id}`} onClick={() => { setActiveProjectId(task.projectId); setCurrentView('projects') }}><span className="work-status-dot" /><span><strong>{task.title}</strong><small>{task.projectName} · {task.status}</small></span><Icon name="arrow" size={14} /></button>)}</div> : <p className="portal-empty">No open tasks. Add project work from the project workspace.</p>}
+                </section>
+                <section className="portal-panel">
+                  <div className="section-heading"><div><div className="section-kicker">BUG TRACKER</div><h2>Unresolved bugs</h2></div><button className="text-button" onClick={() => setCurrentView('projects')}>Open tracker <Icon name="arrow" size={14} /></button></div>
+                  {openDeveloperBugs.length ? <div className="portal-work-list">{openDeveloperBugs.slice(0, 7).map((bug) => <button className="portal-work-row" key={`${bug.projectId}-${bug.id}`} onClick={() => { setActiveProjectId(bug.projectId); setCurrentView('projects') }}><span className="bug-status-dot" /><span><strong>{bug.title}</strong><small>{bug.projectName} · {bug.status}</small></span><Icon name="arrow" size={14} /></button>)}</div> : <p className="portal-empty">No unresolved bugs in the local project list.</p>}
+                </section>
+              </div>
+              <footer className="page-footer"><span>CTRLSPACE <span className="footer-divider">/</span> DEVELOPER WORKSPACE</span><span>Builds, CI/CD, and repository webhooks are not connected</span></footer>
+            </>
+          )}
+
+          {currentView === 'platform-admin' && (
+            <>
+              <section className="welcome-row compact-welcome">
+                <div><div className="eyebrow"><span className="eyebrow-line" /> RESTRICTED CONTROL PLANE</div><h1>Platform Admin</h1><p className="welcome-subtitle">Platform-level account and organization administration.</p></div>
+              </section>
+              <section className="admin-access-panel">
+                <span className="admin-lock"><Icon name="lock" size={22} /></span>
+                <div><div className="section-kicker">ACCESS NOT CONFIGURED</div><h2>Administrative controls are unavailable</h2><p>This workspace has no verified platform-admin identity or server-side authorization. No administrative data or controls are exposed here. Configure trusted server-side identity and role checks before enabling this portal.</p><span className="admin-access-state">LOCKED · NO AUTHORIZATION SOURCE</span></div>
+              </section>
+              <footer className="page-footer"><span>CTRLSPACE <span className="footer-divider">/</span> PLATFORM CONTROL PLANE</span><span>Restricted until verified authorization is configured</span></footer>
+            </>
+          )}
+
           {currentView === 'overview' && (
             <>
               <section className="welcome-row">
@@ -1935,7 +2118,7 @@ function App() {
           {currentView === 'applications' && (
             <>
               <section className="welcome-row compact-welcome">
-                <div><div className="eyebrow"><span className="eyebrow-line" /> RESOURCE LIBRARY</div><h1>Applications</h1><p className="welcome-subtitle">Your team's tools and websites, organized in one place.</p></div>
+                <div><div className="eyebrow"><span className="eyebrow-line" /> RESOURCE LIBRARY</div><h1>Applications</h1><p className="welcome-subtitle">Your workspace's tools and websites, organized in one place.</p></div>
                 <button className="primary-button" onClick={() => setIsAddOpen(true)}><Icon name="plus" size={17} /> Add application</button>
               </section>
               <div className="library-toolbar">
@@ -2066,7 +2249,7 @@ function App() {
                   <div className="section-kicker">PROFILE</div>
                   <h2 id="settings-profile-heading">Your profile</h2>
                   {authUser
-                    ? <div className="settings-account"><strong>{profileName}</strong><span>{authUser.email ?? 'Google account'}</span><p>Your profile name comes from Google while signed in.</p></div>
+                    ? <div className="settings-account"><strong>{profileName}</strong><span>{authUser.email ?? 'Signed-in account'}</span><p>Your account details come from your configured sign-in provider.</p></div>
                     : <form onSubmit={saveLocalDisplayName}>
                         <label className="form-label" htmlFor="local-display-name">Display name</label>
                         <input id="local-display-name" className="form-input" value={displayNameDraft} onChange={(event) => setDisplayNameDraft(event.target.value)} maxLength={60} required />
@@ -2352,25 +2535,107 @@ function Metric({ icon, label, value, trend, tone }: { icon: string; label: stri
   return <article className="metric-card"><div className={`metric-icon ${tone}`}><Icon name={icon} size={17} /></div><div className="metric-label">{label}</div><div className="metric-bottom"><strong>{value}</strong><span>{trend}</span></div></article>
 }
 
-function AuthGate({ loading = false, error = '', onSignIn, onSignOut }: {
+function AuthGate({ loading = false, error = '', message = '', mode = 'sign-in', onSignIn, onEmailSignIn, onCreateAccount, onRecoverPassword, onUpdatePassword, onSignOut }: {
   loading?: boolean
   error?: string
+  message?: string
+  mode?: 'sign-in' | 'update-password'
   onSignIn?: () => Promise<void>
+  onEmailSignIn?: (email: string, password: string) => Promise<void>
+  onCreateAccount?: (email: string, password: string) => Promise<void>
+  onRecoverPassword?: (email: string) => Promise<void>
+  onUpdatePassword?: (password: string) => Promise<void>
   onSignOut?: () => Promise<void>
 }) {
+  const [authMode, setAuthMode] = useState<'sign-in' | 'sign-up' | 'recover'>(mode === 'update-password' ? 'sign-in' : mode)
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [formError, setFormError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  async function submitEmailForm(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setFormError('')
+    if (mode === 'update-password' && password !== confirmPassword) {
+      setFormError('The passwords do not match.')
+      return
+    }
+    setSubmitting(true)
+    try {
+      if (mode === 'update-password') await onUpdatePassword?.(password)
+      else if (authMode === 'sign-up') await onCreateAccount?.(email.trim(), password)
+      else if (authMode === 'recover') await onRecoverPassword?.(email.trim())
+      else await onEmailSignIn?.(email.trim(), password)
+    } catch (error) {
+      console.error('Authentication request could not be completed.', error)
+      setFormError('Could not complete the request. Check your connection and try again.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const title = mode === 'update-password'
+    ? 'Choose a new password'
+    : authMode === 'sign-up'
+      ? 'Create your account'
+      : authMode === 'recover'
+        ? 'Recover your account'
+        : 'Welcome to CTRLSPACE'
+
   return (
     <main className="auth-screen">
       <section className="auth-card">
         <img className="brand-logo" src="/ctrlspace-mark.png" alt="" />
         <div className="eyebrow"><span className="eyebrow-line" /> SECURE WORKSPACE</div>
-        <h1>Welcome to CTRLSPACE</h1>
-        <p className="welcome-subtitle">Sign in with your Google account to open your personal workspace.</p>
+        <h1>{title}</h1>
+        <p className="welcome-subtitle">{mode === 'update-password'
+          ? 'Enter a new password to finish recovering your account.'
+          : authMode === 'sign-up'
+            ? 'Create an account with your email address or continue with Google.'
+            : authMode === 'recover'
+              ? 'We will email you a secure link to reset your password.'
+              : 'Sign in with your email address or Google account to open your personal workspace.'}</p>
         {loading
           ? <p className="auth-loading" role="status">Checking your secure session…</p>
-          : error && <p className="form-error auth-error" role="alert">{error}</p>}
-        {onSignIn && <button className="primary-button auth-submit" onClick={() => { void onSignIn() }}>Continue with Google</button>}
+          : (formError || error) && <p className="form-error auth-error" role="alert">{formError || error}</p>}
+        {message && <p className="auth-message" role="status">{message}</p>}
+        {(onEmailSignIn || onCreateAccount || onRecoverPassword || onUpdatePassword) && !loading && (
+          <form className="auth-form" onSubmit={(event) => { void submitEmailForm(event) }}>
+            {mode !== 'update-password' && (
+              <label className="auth-field">Email address
+                <input className="form-input" type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} />
+              </label>
+            )}
+            {(mode === 'update-password' || authMode !== 'recover') && (
+              <label className="auth-field">{mode === 'update-password' ? 'New password' : 'Password'}
+                <input className="form-input" type="password" autoComplete={mode === 'update-password' ? 'new-password' : authMode === 'sign-up' ? 'new-password' : 'current-password'} minLength={8} required value={password} onChange={(event) => setPassword(event.target.value)} />
+              </label>
+            )}
+            {(authMode === 'sign-up' || mode === 'update-password') && (
+              <label className="auth-field">Confirm password
+                <input className="form-input" type="password" autoComplete="new-password" minLength={8} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
+              </label>
+            )}
+            <button className="primary-button auth-submit" type="submit" disabled={submitting}>
+              {submitting ? 'Please wait…' : mode === 'update-password' ? 'Update password' : authMode === 'sign-up' ? 'Create account' : authMode === 'recover' ? 'Send recovery link' : 'Sign in with email'}
+            </button>
+          </form>
+        )}
+        {mode === 'sign-in' && onSignIn && authMode !== 'recover' && (
+          <>
+            <div className="auth-divider"><span>OR</span></div>
+            <button className="outline-button auth-submit" onClick={() => { void onSignIn() }}>Continue with Google</button>
+          </>
+        )}
+        {mode === 'sign-in' && (onEmailSignIn || onCreateAccount || onRecoverPassword) && (
+          <div className="auth-links">
+            {authMode === 'sign-in' && <><button type="button" onClick={() => { setFormError(''); setAuthMode('sign-up') }}>Create account</button><button type="button" onClick={() => { setFormError(''); setAuthMode('recover') }}>Forgot password?</button></>}
+            {authMode !== 'sign-in' && <button type="button" onClick={() => { setFormError(''); setAuthMode('sign-in') }}>Back to sign in</button>}
+          </div>
+        )}
         {onSignOut && <button className="outline-button auth-submit" onClick={() => { void onSignOut() }}>Sign out and retry</button>}
-        <p className="auth-note">Your local workspace data is kept separately for each signed-in account on this browser.</p>
+        <p className="auth-note">Your local workspace data is kept separately for each signed-in account on this browser. Email confirmation and recovery depend on the Supabase project’s email configuration.</p>
       </section>
     </main>
   )
