@@ -11,6 +11,7 @@ import {
   getApplicationActivity,
   getApplicationProject,
   groupProjectsByTeam,
+  getPersonalRecommendations,
 } from '../src/application-library.mjs'
 
 const apps = [
@@ -129,4 +130,28 @@ test('groups projects by team with named teams first and unfiled last', () => {
 
 test('groups an empty project list without error', () => {
   assert.deepEqual(groupProjectsByTeam([]), [])
+})
+
+test('recommends favorited apps not recently opened, sorted by name', () => {
+  const allApps = [
+    { id: 'a', name: 'Zeta App', favorite: true, lastOpenedAt: '' },
+    { id: 'b', name: 'Alpha App', favorite: true, lastOpenedAt: '2026-10-26T10:00:00.000Z' },
+    { id: 'c', name: 'Beta App', favorite: true, lastOpenedAt: '' },
+    { id: 'd', name: 'Gamma App', favorite: false, lastOpenedAt: '' },
+  ]
+  const recentlyOpened = ['b']
+  const recommended = getPersonalRecommendations(allApps, recentlyOpened)
+  assert.deepEqual(recommended.map((app) => app.id), ['c', 'a'])
+})
+
+test('returns empty when no favorited apps exist', () => {
+  const allApps = [
+    { id: 'a', name: 'App A', favorite: false, lastOpenedAt: '' },
+    { id: 'b', name: 'App B', favorite: false, lastOpenedAt: '' },
+  ]
+  assert.deepEqual(getPersonalRecommendations(allApps, []), [])
+})
+
+test('returns empty for an empty app list', () => {
+  assert.deepEqual(getPersonalRecommendations([], []), [])
 })

@@ -186,3 +186,11 @@ export function groupProjectsByTeam(projects) {
     projects: projectList,
   }))
 }
+
+export function getPersonalRecommendations(applications, recentlyOpenedIds = []) {
+  const opened = new Set(recentlyOpenedIds)
+  return applications
+    .filter((app) => app.favorite && !opened.has(app.id))
+    .sort((left, right) => String(left.name).localeCompare(String(right.name), undefined, { sensitivity: 'base' }))
+    .slice(0, 6)
+}

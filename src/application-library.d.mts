@@ -23,4 +23,5 @@ export type ApplicationActivityInput = { id: string; appId: string; title: strin
 export function createApplicationActivityRecord(input: ApplicationActivityInput): { id: string; category: 'application'; appId: string; title: string; detail: string; createdAt: string }
 export type ProjectTeamGroup = { team: string; projects: readonly { id: string; name: string; team?: string; tasks: readonly { status: string }[]; bugs: readonly { status: string }[] }[] }
 export function groupProjectsByTeam(projects: readonly { id: string; name: string; team?: string; tasks: readonly { status: string }[]; bugs: readonly { status: string }[] }[]): ProjectTeamGroup[]
+export function getPersonalRecommendations<T extends { id: string; name: string; favorite: boolean; lastOpenedAt?: string }>(applications: readonly T[], recentlyOpenedIds?: readonly string[]): T[]
 

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type
 import type { User } from '@supabase/supabase-js'
 import { supabase, supabaseConfigStatus, workspaceStorageKey } from './supabase'
 import { createWorkspaceSnapshot, isWorkspaceSnapshot } from './workspace-data'
-import { createApplicationActivityRecord, createLibraryMetadata, filterApplications, getApplicationActivity, getApplicationProject, getLibraryFolders, groupProjectsByTeam, isInactiveApplication, isValidLibraryDate, normalizeLibraryFolder } from './application-library.mjs'
+import { createApplicationActivityRecord, createLibraryMetadata, filterApplications, getApplicationActivity, getApplicationProject, getLibraryFolders, getPersonalRecommendations, groupProjectsByTeam, isInactiveApplication, isValidLibraryDate, normalizeLibraryFolder } from './application-library.mjs'
 import './App.css'
 
 type AppStatus = 'online' | 'offline' | 'degraded' | 'unknown'
@@ -566,8 +566,8 @@ function App() {
   const [currentView, setCurrentView] = useState<View>(() =>
     new URLSearchParams(window.location.search).get('import') === '1' ? 'applications' : 'overview',
   )
-  const [lastActivePortal, setLastActivePortal] = useState<'Personal' | 'Business' | 'Developer' | 'Platform admin'>(
-    currentView === 'applications' ? 'Business' : 'Personal',
+  const [lastActivePortal, setLastActivePortal] = useState<'Personal Portal' | 'Business Portal' | 'Developer Portal' | 'Platform Administration Portal'>(
+    currentView === 'applications' ? 'Business Portal' : 'Personal Portal',
   )
   const [themePreference, setThemePreference] = useState<ThemePreference>(loadThemePreference)
   const [accentPreference, setAccentPreference] = useState<AccentPreference>(loadAccentPreference)
@@ -1061,6 +1061,7 @@ function App() {
     .filter((app) => app.lastOpenedAt)
     .sort((left, right) => Date.parse(right.lastOpenedAt ?? '') - Date.parse(left.lastOpenedAt ?? ''))
     .slice(0, 6), [apps])
+  const recommendedApps = useMemo(() => getPersonalRecommendations(apps, recentlyOpenedApps.map((app) => app.id)), [apps, recentlyOpenedApps])
   const collectionOptions = useMemo(() => [...collections, 'Unfiled'], [collections])
   const metadataEditingApp = apps.find((app) => app.id === metadataEditingAppId) ?? null
   const hasLibraryFilters = Boolean(query || category !== 'All applications' || activeCollection !== 'All collections' || libraryStatusFilter !== 'all' || libraryTagFilter !== 'all' || libraryFolderFilter !== 'all' || libraryProjectFilter !== 'all' || libraryOwnerFilter !== 'all' || libraryMaintenanceFilter !== 'all')
@@ -2022,24 +2023,24 @@ function App() {
     settings: 'Settings',
   }[currentView]
   const activePortal = currentView === 'business-portal' || currentView === 'applications' || currentView === 'application-detail'
-    ? 'Business'
+    ? 'Business Portal'
     : currentView === 'developer-portal' || currentView === 'projects'
-      ? 'Developer'
+      ? 'Developer Portal'
       : currentView === 'platform-admin'
-        ? 'Platform admin'
+        ? 'Platform Administration Portal'
         : currentView === 'overview'
-          ? 'Personal'
+          ? 'Personal Portal'
           : lastActivePortal
-  const portalHomeView: View = activePortal === 'Business'
+  const portalHomeView: View = activePortal === 'Business Portal'
     ? 'business-portal'
-    : activePortal === 'Developer'
+    : activePortal === 'Developer Portal'
       ? 'developer-portal'
-      : activePortal === 'Platform admin'
+      : activePortal === 'Platform Administration Portal'
         ? 'platform-admin'
         : 'overview'
   const navItems: { id: View; label: string; icon: string }[] = [
-    { id: portalHomeView, label: activePortal === 'Personal' ? 'Overview' : 'Portal dashboard', icon: 'grid' },
-    ...(activePortal === 'Developer'
+    { id: portalHomeView, label: activePortal === 'Personal Portal' ? 'Overview' : 'Portal dashboard', icon: 'grid' },
+    ...(activePortal === 'Developer Portal'
       ? [
           { id: 'projects' as const, label: 'Projects', icon: 'folder' },
           { id: 'applications' as const, label: 'Applications', icon: 'layers' },
@@ -2108,10 +2109,10 @@ function App() {
         <div className="nav-label portal-label">PORTALS</div>
         <div className="portal-nav" aria-label="Portal selector">
           {([
-            { label: 'Personal', view: 'overview' as const },
-            { label: 'Business', view: 'business-portal' as const },
-            { label: 'Developer', view: 'developer-portal' as const },
-            { label: 'Platform admin', view: 'platform-admin' as const },
+            { label: 'Personal Portal', view: 'overview' as const },
+            { label: 'Business Portal', view: 'business-portal' as const },
+            { label: 'Developer Portal', view: 'developer-portal' as const },
+            { label: 'Platform Administration Portal', view: 'platform-admin' as const },
           ] as const).map((item, index) => (
             <button key={item.label} className={`portal-item ${activePortal === item.label ? 'selected' : ''}`} onClick={() => {
               setLastActivePortal(item.label)
@@ -2447,6 +2448,27 @@ function App() {
                     </div>
                   : <div className="reminder-empty">Your opened applications and repositories will appear here.</div>}
               </section>
+
+              {recommendedApps.length > 0 && (
+                <section className="section-block">
+                  <div className="section-heading">
+                    <div><div className="section-kicker">PERSONAL PORTAL</div><h2>Recommended for you <span className="subtle-count">{String(recommendedApps.length).padStart(2, '0')}</span></h2></div>
+                    <button className="text-button" onClick={() => setCurrentView('applications')}>Browse library <Icon name="arrow" size={14} /></button>
+                  </div>
+                  <div className="recent-app-list">
+                    {recommendedApps.map((app) => (
+                      <div className="recent-app-row" key={app.id}>
+                        <div className={`recent-app-icon ${app.tint}`}>{app.icon}</div>
+                        <div className="recent-app-copy"><strong>{app.name}</strong><span>{app.category} · Favorite</span></div>
+                        <div className="recent-app-actions">
+                          {app.repositoryUrl && <a href={app.repositoryUrl} target="_blank" rel="noreferrer" aria-label={`Open ${app.name} repository`} title="Open repository" onClick={() => recordAppLaunch(app, 'repository')}><Icon name="layers" size={15} /></a>}
+                          {app.url && <a href={app.url} target="_blank" rel="noreferrer" aria-label={`Open ${app.name}`} title="Open website" onClick={() => recordAppLaunch(app, 'website')}><Icon name="external" size={15} /></a>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
 
               <section className="section-block">
                 <div className="section-heading">
