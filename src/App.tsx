@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import type { User } from '@supabase/supabase-js'
 import { supabase, supabaseConfigStatus, workspaceStorageKey } from './supabase'
+import { createWorkspaceSnapshot, isWorkspaceSnapshot } from './workspace-data'
+import { createApplicationActivityRecord, createLibraryMetadata, filterApplications, getApplicationActivity, getApplicationProject, getLibraryFolders, groupProjectsByTeam, isInactiveApplication, isValidLibraryDate, normalizeLibraryFolder } from './application-library.mjs'
 import './App.css'
 
 type AppStatus = 'online' | 'offline' | 'degraded' | 'unknown'
@@ -28,12 +30,27 @@ type AppRecord = {
   lastOpenedAt?: string
   responseTimeMs?: number
   statusDetail?: string
+  websiteTitle?: string
+  faviconUrl?: string
+  previewImageUrl?: string
+  libraryFolder?: string
+  tags?: string[]
+  owner?: string
+  projectId?: string
+  lastUpdatedAt?: string
+  lastDeployedAt?: string
+}
+type WebsiteMetadata = {
+  title: string | null
+  faviconUrl: string | null
+  previewImageUrl: string | null
 }
 type Project = {
   id: string
   name: string
   description: string
   color: string
+  team?: string
   tasks: ProjectTask[]
   bugs: ProjectBug[]
 }
@@ -71,8 +88,9 @@ type WorkspaceActivity = {
   title: string
   detail: string
   createdAt: string
+  appId?: string
 }
-type View = 'overview' | 'business-portal' | 'developer-portal' | 'platform-admin' | 'applications' | 'projects' | 'activity' | 'settings'
+type View = 'overview' | 'business-portal' | 'developer-portal' | 'platform-admin' | 'applications' | 'application-detail' | 'projects' | 'activity' | 'settings'
 type ThemePreference = 'system' | 'light' | 'dark'
 type AccentPreference = 'nebula' | 'cyber' | 'matrix' | 'arctic' | 'ember' | 'synthwave'
 type FontPreference = 'system' | 'code' | 'terminal'
@@ -166,11 +184,20 @@ function isAppRecord(value: unknown): value is AppRecord {
     (record.lastOpenedAt !== undefined && (typeof record.lastOpenedAt !== 'string' || Number.isNaN(Date.parse(record.lastOpenedAt)))) ||
     (record.responseTimeMs !== undefined && (typeof record.responseTimeMs !== 'number' || !Number.isFinite(record.responseTimeMs) || record.responseTimeMs < 0)) ||
     (record.statusDetail !== undefined && typeof record.statusDetail !== 'string') ||
+    (record.websiteTitle !== undefined && (typeof record.websiteTitle !== 'string' || record.websiteTitle.length > 200)) ||
+    (record.faviconUrl !== undefined && (typeof record.faviconUrl !== 'string' || record.faviconUrl.length > 2048)) ||
+    (record.previewImageUrl !== undefined && (typeof record.previewImageUrl !== 'string' || record.previewImageUrl.length > 2048)) ||
+    (record.libraryFolder !== undefined && (typeof record.libraryFolder !== 'string' || !isSafeLibraryFolder(record.libraryFolder))) ||
+    (record.tags !== undefined && (!Array.isArray(record.tags) || record.tags.length > 20 || !record.tags.every((tag) => typeof tag === 'string' && tag.trim().length > 0 && tag.length <= 40))) ||
+    (record.owner !== undefined && (typeof record.owner !== 'string' || record.owner.length > 80)) ||
+    (record.projectId !== undefined && (typeof record.projectId !== 'string' || record.projectId.length > 128)) ||
+    (record.lastUpdatedAt !== undefined && (typeof record.lastUpdatedAt !== 'string' || !isValidLibraryDate(record.lastUpdatedAt))) ||
+    (record.lastDeployedAt !== undefined && (typeof record.lastDeployedAt !== 'string' || !isValidLibraryDate(record.lastDeployedAt))) ||
     !['online', 'offline', 'degraded', 'unknown'].includes(String(record.status)) ||
     !['violet', 'blue', 'mint', 'orange'].includes(record.tint)
   ) return false
 
-  for (const urlValue of [record.url, record.repositoryUrl ?? '']) {
+  for (const urlValue of [record.url, record.repositoryUrl ?? '', record.faviconUrl ?? '', record.previewImageUrl ?? '']) {
     if (urlValue === '') continue
     try {
       const url = new URL(urlValue)
@@ -181,6 +208,36 @@ function isAppRecord(value: unknown): value is AppRecord {
     }
   }
   return true
+}
+
+function isSafeLibraryFolder(value: string) {
+  try {
+    return normalizeLibraryFolder(value) === value
+  } catch {
+    return false
+  }
+}
+
+function isWebsiteMetadata(value: unknown): value is WebsiteMetadata {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  const isHttpUrl = (candidate: unknown) => {
+    if (candidate === null) return true
+    if (typeof candidate !== 'string' || candidate.length > 2048) return false
+    try {
+      const url = new URL(candidate)
+      return (url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password
+    } catch {
+      return false
+    }
+  }
+  return (record.title === null || (typeof record.title === 'string' && record.title.length <= 200))
+    && isHttpUrl(record.faviconUrl)
+    && isHttpUrl(record.previewImageUrl)
+}
+
+function websiteAssetProxyUrl(url: string, kind: 'icon' | 'preview') {
+  return `/api/website/preview?kind=${kind}&url=${encodeURIComponent(url)}`
 }
 
 function Icon({ name, size = 18 }: { name: string; size?: number }) {
@@ -419,6 +476,7 @@ function isProject(value: unknown): value is Project {
     && typeof project.description === 'string'
     && typeof project.color === 'string'
     && projectColors.includes(project.color)
+    && (project.team === undefined || typeof project.team === 'string')
     && Array.isArray(project.tasks)
     && project.tasks.every(isProjectTask)
     && (project.bugs === undefined || (Array.isArray(project.bugs) && project.bugs.every(isProjectBug)))
@@ -432,6 +490,7 @@ function loadProjects(storageKey = 'ctrlspace.projects.v1'): Project[] {
     if (Array.isArray(parsed) && parsed.every(isProject)) {
       return parsed.map((project) => ({
         ...project,
+        team: project.team ?? '',
         tasks: project.tasks.map((task) => ({ ...task, description: task.description ?? '', assignee: task.assignee ?? '', startDate: task.startDate ?? '' })),
         bugs: (project.bugs ?? []).map((bug) => ({ ...bug, category: bug.category ?? 'other', assignee: bug.assignee ?? '', relatedUrl: bug.relatedUrl ?? '', reminderDate: bug.reminderDate ?? '' })),
       }))
@@ -520,7 +579,14 @@ function App() {
   const [projects, setProjects] = useState<Project[]>(loadProjects)
   const [authUser, setAuthUser] = useState<User | null>(null)
   const [authLoading, setAuthLoading] = useState(supabaseConfigStatus !== 'missing')
-  const [workspaceOwnerId, setWorkspaceOwnerId] = useState<string | null>(null)
+  const [workspaceSyncReadyUserId, setWorkspaceSyncReadyUserId] = useState<string | null>(null)
+  const [workspaceSyncLoading, setWorkspaceSyncLoading] = useState(false)
+  const [workspaceSyncError, setWorkspaceSyncError] = useState('')
+  const [workspaceBackupAvailable, setWorkspaceBackupAvailable] = useState(false)
+  const workspaceRevision = useRef(0)
+  const workspaceBaseline = useRef('')
+  const workspaceWriteQueue = useRef(Promise.resolve())
+  const workspaceWriteBlocked = useRef(false)
   const [authError, setAuthError] = useState('')
   const [authMessage, setAuthMessage] = useState('')
   const [passwordRecovery, setPasswordRecovery] = useState(() =>
@@ -536,6 +602,12 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [category, setCategory] = useState('All applications')
   const [activeCollection, setActiveCollection] = useState('All collections')
+  const [libraryStatusFilter, setLibraryStatusFilter] = useState('all')
+  const [libraryTagFilter, setLibraryTagFilter] = useState('all')
+  const [libraryFolderFilter, setLibraryFolderFilter] = useState('all')
+  const [libraryProjectFilter, setLibraryProjectFilter] = useState('all')
+  const [libraryOwnerFilter, setLibraryOwnerFilter] = useState('all')
+  const [libraryMaintenanceFilter, setLibraryMaintenanceFilter] = useState('all')
   const [layout, setLayout] = useState<'grid' | 'list'>('grid')
   const [isAddOpen, setIsAddOpen] = useState(() =>
     new URLSearchParams(window.location.search).get('import') === '1',
@@ -546,6 +618,7 @@ function App() {
   const [isTaskOpen, setIsTaskOpen] = useState(false)
   const [isBugOpen, setIsBugOpen] = useState(false)
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null)
+  const [selectedApplicationId, setSelectedApplicationId] = useState<string | null>(null)
   const [formError, setFormError] = useState('')
   const [collectionError, setCollectionError] = useState('')
   const [projectError, setProjectError] = useState('')
@@ -554,6 +627,7 @@ function App() {
   const [collectionName, setCollectionName] = useState('')
   const [projectName, setProjectName] = useState('')
   const [projectDescription, setProjectDescription] = useState('')
+  const [projectTeam, setProjectTeam] = useState('')
   const [taskTitle, setTaskTitle] = useState('')
   const [taskDescription, setTaskDescription] = useState('')
   const [taskAssignee, setTaskAssignee] = useState('')
@@ -593,19 +667,44 @@ function App() {
       : 'GitHub did not complete the repository setup.'
   })
   const [websiteMetadataTitle, setWebsiteMetadataTitle] = useState('')
+  const [websiteMetadataFaviconUrl, setWebsiteMetadataFaviconUrl] = useState('')
+  const [websiteMetadataPreviewImageUrl, setWebsiteMetadataPreviewImageUrl] = useState('')
   const [websiteMetadataUrl, setWebsiteMetadataUrl] = useState('')
   const [websiteMetadataLoading, setWebsiteMetadataLoading] = useState(false)
   const [websiteMetadataError, setWebsiteMetadataError] = useState('')
-  const websiteMetadataLookup = useRef<{ url: string; controller: AbortController; promise: Promise<string | null> } | null>(null)
+  const websiteMetadataLookup = useRef<{ url: string; controller: AbortController; promise: Promise<WebsiteMetadata> } | null>(null)
+  const websiteMetadataRequestVersion = useRef(0)
   const [isAddingApplication, setIsAddingApplication] = useState(false)
   const [directoryHandle, setDirectoryHandle] = useState<FileSystemDirectoryHandle | null>(null)
   const [appCategory, setAppCategory] = useState('Productivity')
   const [appCollection, setAppCollection] = useState('')
+  const [appLibraryFolder, setAppLibraryFolder] = useState('')
+  const [appTags, setAppTags] = useState('')
+  const [appOwner, setAppOwner] = useState('')
+  const [appProjectId, setAppProjectId] = useState('')
+  const [appLastUpdatedAt, setAppLastUpdatedAt] = useState('')
+  const [appLastDeployedAt, setAppLastDeployedAt] = useState('')
+  const [metadataEditingAppId, setMetadataEditingAppId] = useState<string | null>(null)
 
   const acceptAuthUser = useCallback((user: User | null) => {
     setAuthUser(user)
-    if (!supabase || !user) return
+    if (!supabase) return
+    if (!user) {
+      setWorkspaceSyncReadyUserId(null)
+      setWorkspaceSyncLoading(false)
+      setWorkspaceSyncError('')
+      setWorkspaceBackupAvailable(false)
+      workspaceBaseline.current = ''
+      workspaceRevision.current = 0
+      workspaceWriteBlocked.current = false
+      return
+    }
+    setWorkspaceSyncReadyUserId(null)
+    setWorkspaceSyncLoading(true)
+    setWorkspaceSyncError('')
+    workspaceWriteBlocked.current = false
     try {
+      setWorkspaceBackupAvailable(window.localStorage.getItem(workspaceStorageKey(user.id, 'ctrlspace.pending-workspace.v1')) !== null)
       const localKeys = ['ctrlspace.apps.v1', 'ctrlspace.collections.v1', 'ctrlspace.projects.v1', 'ctrlspace.activity.v1']
       for (const key of localKeys) {
         const scopedKey = workspaceStorageKey(user.id, key)
@@ -613,16 +712,15 @@ function App() {
         const localValue = window.localStorage.getItem(key)
         if (localValue === null) continue
         window.localStorage.setItem(scopedKey, localValue)
-        window.localStorage.removeItem(key)
       }
       setApps(loadApps(workspaceStorageKey(user.id, 'ctrlspace.apps.v1')))
       setCollections(loadCollections(workspaceStorageKey(user.id, 'ctrlspace.collections.v1')))
       setProjects(loadProjects(workspaceStorageKey(user.id, 'ctrlspace.projects.v1')))
       setActivities(loadActivity(workspaceStorageKey(user.id, 'ctrlspace.activity.v1')))
-      setWorkspaceOwnerId(user.id)
       setAuthError('')
     } catch (error) {
       console.error('The local workspace could not be prepared for this account.', error)
+      setWorkspaceSyncLoading(false)
       setAuthError('Could not load this account’s local workspace. Check browser storage and try again.')
     }
   }, [])
@@ -653,6 +751,149 @@ function App() {
       subscription.unsubscribe()
     }
   }, [acceptAuthUser])
+
+  useEffect(() => {
+    const client = supabase
+    if (!client || !authUser) return
+    let active = true
+    const userId = authUser.id
+
+    async function initializeSharedWorkspace() {
+      if (!client) return
+      setWorkspaceSyncLoading(true)
+      setWorkspaceSyncError('')
+      try {
+        const { data: existing, error: loadError } = await client
+                  .from('user_workspace_data')
+          .select('data, revision')
+          .eq('user_id', userId)
+          .maybeSingle()
+        if (loadError) throw new Error(`Could not load the shared workspace: ${loadError.message}`)
+        if (!active) return
+
+        let snapshot: ReturnType<typeof createWorkspaceSnapshot>
+        let revision: number
+        if (existing) {
+          const record = existing as { data?: unknown; revision?: unknown }
+          if (!isWorkspaceSnapshot(record.data)
+            || !record.data.apps.every(isAppRecord)
+            || !record.data.projects.every(isProject)
+            || !record.data.activity.every(isWorkspaceActivity)
+            || typeof record.revision !== 'number'
+            || !Number.isSafeInteger(record.revision)
+            || record.revision < 1) {
+            throw new Error('The shared workspace has an unsupported or invalid format. Local data was left untouched.')
+          }
+          const accountKeys = ['ctrlspace.apps.v1', 'ctrlspace.collections.v1', 'ctrlspace.projects.v1', 'ctrlspace.activity.v1']
+          const hasLocalCopy = accountKeys.some((key) => window.localStorage.getItem(workspaceStorageKey(userId, key)) !== null)
+          if (hasLocalCopy) {
+            const localSnapshot = createWorkspaceSnapshot({
+              apps: loadApps(workspaceStorageKey(userId, 'ctrlspace.apps.v1')),
+              collections: loadCollections(workspaceStorageKey(userId, 'ctrlspace.collections.v1')),
+              projects: loadProjects(workspaceStorageKey(userId, 'ctrlspace.projects.v1')),
+              activity: loadActivity(workspaceStorageKey(userId, 'ctrlspace.activity.v1')),
+            })
+            if (JSON.stringify(localSnapshot) !== JSON.stringify(record.data)) {
+              const rawLocalCopy = Object.fromEntries(accountKeys.map((key) => [
+                key,
+                window.localStorage.getItem(workspaceStorageKey(userId, key)),
+              ]))
+              window.localStorage.setItem(workspaceStorageKey(userId, 'ctrlspace.pending-workspace.v1'), JSON.stringify({
+                schemaVersion: 1,
+                savedAt: new Date().toISOString(),
+                snapshot: localSnapshot,
+                rawLocalCopy,
+              }))
+              setWorkspaceBackupAvailable(true)
+            }
+          }
+          snapshot = record.data
+          revision = record.revision
+          setApps(snapshot.apps as AppRecord[])
+          setCollections(snapshot.collections)
+          setProjects(snapshot.projects as Project[])
+          setActivities(snapshot.activity as WorkspaceActivity[])
+        } else {
+          snapshot = createWorkspaceSnapshot({
+            apps: loadApps(workspaceStorageKey(userId, 'ctrlspace.apps.v1')),
+            collections: loadCollections(workspaceStorageKey(userId, 'ctrlspace.collections.v1')),
+            projects: loadProjects(workspaceStorageKey(userId, 'ctrlspace.projects.v1')),
+            activity: loadActivity(workspaceStorageKey(userId, 'ctrlspace.activity.v1')),
+          })
+          const { data: created, error: createError } = await client
+                      .from('user_workspace_data')
+            .insert({ user_id: userId, data: snapshot })
+            .select('revision')
+            .single()
+          if (createError) throw new Error(`Could not create the shared workspace: ${createError.message}`)
+          if (!active) return
+          if (!created || typeof created.revision !== 'number' || !Number.isSafeInteger(created.revision) || created.revision < 1) {
+            throw new Error('The shared workspace was created but its version could not be verified.')
+          }
+          revision = created.revision
+        }
+
+        const scopedKeys = {
+          apps: workspaceStorageKey(userId, 'ctrlspace.apps.v1'),
+          collections: workspaceStorageKey(userId, 'ctrlspace.collections.v1'),
+          projects: workspaceStorageKey(userId, 'ctrlspace.projects.v1'),
+          activity: workspaceStorageKey(userId, 'ctrlspace.activity.v1'),
+        }
+        window.localStorage.setItem(scopedKeys.apps, JSON.stringify(snapshot.apps))
+        window.localStorage.setItem(scopedKeys.collections, JSON.stringify(snapshot.collections))
+        window.localStorage.setItem(scopedKeys.projects, JSON.stringify(snapshot.projects))
+        window.localStorage.setItem(scopedKeys.activity, JSON.stringify(snapshot.activity))
+        workspaceRevision.current = revision
+        workspaceBaseline.current = JSON.stringify(snapshot)
+        workspaceWriteBlocked.current = false
+        setWorkspaceSyncReadyUserId(userId)
+      } catch (error) {
+        console.error('The shared workspace could not be initialized.', error)
+        if (active) {
+          workspaceWriteBlocked.current = true
+          setWorkspaceSyncError(error instanceof Error ? error.message : 'The shared workspace could not be loaded.')
+        }
+      } finally {
+        if (active) setWorkspaceSyncLoading(false)
+      }
+    }
+
+    void initializeSharedWorkspace()
+    return () => { active = false }
+  }, [authUser])
+
+  useEffect(() => {
+    const client = supabase
+    if (!client || !authUser || workspaceSyncReadyUserId !== authUser.id || workspaceWriteBlocked.current) return
+    const snapshot = createWorkspaceSnapshot({ apps, collections, projects, activity: activities })
+    const signature = JSON.stringify(snapshot)
+    if (signature === workspaceBaseline.current) return
+
+    const timer = window.setTimeout(() => {
+      workspaceWriteQueue.current = workspaceWriteQueue.current.then(async () => {
+        if (!client || workspaceWriteBlocked.current || signature === workspaceBaseline.current) return
+        const expectedRevision = workspaceRevision.current
+        const { data: saved, error } = await client
+                  .from('user_workspace_data')
+          .update({ data: snapshot, revision: expectedRevision + 1, updated_at: new Date().toISOString() })
+          .eq('user_id', authUser.id)
+          .eq('revision', expectedRevision)
+          .select('revision')
+          .maybeSingle()
+        if (error) throw new Error(`Could not save the shared workspace: ${error.message}`)
+        if (!saved || typeof saved.revision !== 'number' || !Number.isSafeInteger(saved.revision)) {
+          throw new Error('The workspace changed in another session. Your local copy is preserved; reload before editing further.')
+        }
+        workspaceRevision.current = saved.revision
+        workspaceBaseline.current = signature
+      }).catch((error: unknown) => {
+        console.error('The shared workspace could not be saved.', error)
+        workspaceWriteBlocked.current = true
+        setWorkspaceSyncError(error instanceof Error ? error.message : 'The shared workspace could not be saved.')
+      })
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [apps, collections, projects, activities, authUser, workspaceSyncReadyUserId])
 
   useEffect(() => {
     const systemTheme = window.matchMedia('(prefers-color-scheme: light)')
@@ -774,18 +1015,26 @@ function App() {
     return () => document.removeEventListener('pointerdown', closeOnOutsideClick)
   }, [profileMenuOpen])
 
-  const filteredApps = useMemo(() => apps.filter((app) => {
-    const matchesQuery = `${app.name} ${app.category} ${app.collection} ${app.url} ${app.repositoryUrl}`.toLowerCase().includes(query.toLowerCase())
-    const matchesCategory = category === 'All applications' || app.category === category
-    const matchesCollection = activeCollection === 'All collections'
-      || (activeCollection === 'Unfiled' ? !app.collection : app.collection === activeCollection)
-    return matchesQuery && matchesCategory && matchesCollection
-  }), [apps, activeCollection, category, query])
+  const libraryFolders = useMemo(() => getLibraryFolders(apps), [apps])
+  const libraryTags = useMemo(() => [...new Map(apps.flatMap((app) => app.tags ?? []).map((tag) => [tag.toLocaleLowerCase(), tag])).values()]
+    .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' })), [apps])
+  const libraryOwners = useMemo(() => [...new Set(apps.map((app) => app.owner?.trim()).filter((owner): owner is string => Boolean(owner)))]
+    .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' })), [apps])
+  const filteredApps = useMemo(() => filterApplications(apps, {
+    query,
+    category,
+    collection: activeCollection,
+    status: libraryStatusFilter,
+    tag: libraryTagFilter === 'all' ? '' : libraryTagFilter,
+    folder: libraryFolderFilter === 'all' ? '' : libraryFolderFilter,
+    projectId: libraryProjectFilter === 'all' ? '' : libraryProjectFilter,
+    owner: libraryOwnerFilter === 'all' ? '' : libraryOwnerFilter,
+    maintenance: libraryMaintenanceFilter,
+  }, projects, today), [apps, activeCollection, category, libraryFolderFilter, libraryMaintenanceFilter, libraryOwnerFilter, libraryProjectFilter, libraryStatusFilter, libraryTagFilter, projects, query, today])
   const searchResults = useMemo<SearchResult[]>(() => {
     const term = query.trim().toLowerCase()
     if (!term) return []
-    const applicationResults = apps
-      .filter((app) => `${app.name} ${app.category} ${app.collection} ${app.url} ${app.repositoryUrl}`.toLowerCase().includes(term))
+    const applicationResults = filterApplications(apps, { query: term }, projects)
       .map((app): SearchResult => ({ id: app.id, type: 'application', title: app.name, detail: `Application · ${app.category}` }))
     const projectResults = projects.flatMap((project): SearchResult[] => {
       const results: SearchResult[] = []
@@ -813,7 +1062,25 @@ function App() {
     .sort((left, right) => Date.parse(right.lastOpenedAt ?? '') - Date.parse(left.lastOpenedAt ?? ''))
     .slice(0, 6), [apps])
   const collectionOptions = useMemo(() => [...collections, 'Unfiled'], [collections])
+  const metadataEditingApp = apps.find((app) => app.id === metadataEditingAppId) ?? null
+  const hasLibraryFilters = Boolean(query || category !== 'All applications' || activeCollection !== 'All collections' || libraryStatusFilter !== 'all' || libraryTagFilter !== 'all' || libraryFolderFilter !== 'all' || libraryProjectFilter !== 'all' || libraryOwnerFilter !== 'all' || libraryMaintenanceFilter !== 'all')
+  const resetLibraryFilters = () => {
+    setQuery('')
+    setCategory('All applications')
+    setActiveCollection('All collections')
+    setLibraryStatusFilter('all')
+    setLibraryTagFilter('all')
+    setLibraryFolderFilter('all')
+    setLibraryProjectFilter('all')
+    setLibraryOwnerFilter('all')
+    setLibraryMaintenanceFilter('all')
+  }
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? null
+  const activeApplication = apps.find((app) => app.id === selectedApplicationId) ?? null
+  const linkedApplicationProject = activeApplication ? getApplicationProject(activeApplication, projects) : null
+  const applicationActivities = useMemo(() => activeApplication
+    ? getApplicationActivity(activities, activeApplication.id)
+    : [], [activeApplication, activities])
   const visibleProjectBugs = activeProject?.bugs.filter((bug) =>
     bugCategoryFilter === 'all' || bug.category === bugCategoryFilter,
   ) ?? []
@@ -897,14 +1164,13 @@ function App() {
     setProjects(nextProjects)
   }
 
-  function recordActivity(category: ActivityCategory, title: string, detail: string) {
-    const nextActivities = [{
-      id: crypto.randomUUID(),
-      category,
-      title,
-      detail,
-      createdAt: new Date().toISOString(),
-    }, ...activities].slice(0, 100)
+  function recordActivity(category: ActivityCategory, title: string, detail: string, appId?: string) {
+    const id = crypto.randomUUID()
+    const createdAt = new Date().toISOString()
+    const activity: WorkspaceActivity = category === 'application' && appId
+      ? createApplicationActivityRecord({ id, appId, title, detail, createdAt })
+      : { id, category, title, detail, createdAt }
+    const nextActivities = [activity, ...activities].slice(0, 100)
     window.localStorage.setItem(workspaceStorageKey(authUser?.id ?? null, 'ctrlspace.activity.v1'), JSON.stringify(nextActivities))
     setActivities(nextActivities)
   }
@@ -944,7 +1210,7 @@ function App() {
         statusDetail: data.detail,
       }
       saveApps(apps.map((item) => item.id === app.id ? updatedApp : item))
-      recordActivity('application', 'Checked website health', `${app.name} · ${updatedApp.status} · ${updatedApp.responseTimeMs} ms`)
+      recordActivity('application', 'Checked website health', `${app.name} · ${updatedApp.status} · ${updatedApp.responseTimeMs} ms`, app.id)
     } catch (error) {
       console.error('Website health check failed.', error)
       setCheckError({ appId: app.id, message: error instanceof Error ? error.message : 'Could not check this website.' })
@@ -968,6 +1234,7 @@ function App() {
       id: crypto.randomUUID(),
       name,
       description: projectDescription.trim(),
+      team: projectTeam.trim(),
       color: projectColors[projects.length % projectColors.length],
       tasks: [],
       bugs: [],
@@ -977,6 +1244,7 @@ function App() {
     setActiveProjectId(project.id)
     setProjectName('')
     setProjectDescription('')
+    setProjectTeam('')
     setProjectError('')
     setIsProjectOpen(false)
   }
@@ -1177,7 +1445,7 @@ function App() {
     const nextCollection = collection === 'Unfiled' ? '' : collection
     if (!app || app.collection === nextCollection) return
     saveApps(apps.map((item) => item.id === id ? { ...item, collection: nextCollection } : item))
-    recordActivity('application', 'Changed application collection', `${app.name} · ${collection}`)
+    recordActivity('application', 'Changed application collection', `${app.name} · ${collection}`, app.id)
   }
 
   async function loadGitHubRepositories() {
@@ -1243,10 +1511,11 @@ function App() {
     }
   }
 
-  function lookupWebsiteTitle(value: string) {
+  function lookupWebsiteMetadata(value: string): Promise<WebsiteMetadata> {
     const url = new URL(value).toString()
     if (websiteMetadataLookup.current?.url === url) return websiteMetadataLookup.current.promise
     websiteMetadataLookup.current?.controller.abort()
+    const requestVersion = ++websiteMetadataRequestVersion.current
     const controller = new AbortController()
     setWebsiteMetadataLoading(true)
     setWebsiteMetadataError('')
@@ -1259,11 +1528,14 @@ function App() {
           signal: controller.signal,
         })
         const result: unknown = await response.json()
-        if (typeof result !== 'object' || result === null) throw new Error('The website metadata response was invalid.')
-        const data = result as { title?: unknown; error?: unknown }
-        if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : 'Could not retrieve the website title.')
-        if (data.title !== null && typeof data.title !== 'string') throw new Error('The website metadata response was invalid.')
-        return data.title
+        if (!response.ok) {
+          const message = typeof result === 'object' && result !== null && typeof (result as { error?: unknown }).error === 'string'
+            ? (result as { error: string }).error
+            : 'Could not retrieve website metadata.'
+          throw new Error(message)
+        }
+        if (!isWebsiteMetadata(result)) throw new Error('The website metadata response was invalid.')
+        return result
       } finally {
         if (websiteMetadataLookup.current?.controller === controller) {
           websiteMetadataLookup.current = null
@@ -1272,11 +1544,18 @@ function App() {
       }
     })()
     websiteMetadataLookup.current = { url, controller, promise }
+    void promise.catch(() => {
+      if (requestVersion === websiteMetadataRequestVersion.current
+        && websiteMetadataLookup.current?.controller === controller) {
+        websiteMetadataLookup.current = null
+        setWebsiteMetadataLoading(false)
+      }
+    })
     return promise
   }
 
-  function previewWebsiteTitle(value: string) {
-    if (appName.trim() || !value.trim()) return
+  function previewWebsiteMetadata(value: string) {
+    if (!value.trim()) return
     let url: URL
     try {
       url = new URL(value.trim())
@@ -1285,15 +1564,21 @@ function App() {
     }
     if (url.protocol !== 'https:' && url.protocol !== 'http:') return
     const normalizedUrl = url.toString()
-    void lookupWebsiteTitle(normalizedUrl).then((title) => {
-      if (websiteMetadataLookup.current || websiteMetadataUrl === normalizedUrl) return
+    if (websiteMetadataUrl === normalizedUrl) return
+    const request = lookupWebsiteMetadata(normalizedUrl)
+    const requestVersion = websiteMetadataRequestVersion.current
+    void request.then((metadata) => {
+      if (requestVersion !== websiteMetadataRequestVersion.current || websiteMetadataUrl === normalizedUrl) return
       setWebsiteMetadataUrl(normalizedUrl)
-      setWebsiteMetadataTitle(title ?? '')
-      if (!title) setWebsiteMetadataError('No page title was found. CTRLSPACE will use the website domain instead.')
+      setWebsiteMetadataTitle(metadata.title ?? '')
+      setWebsiteMetadataFaviconUrl(metadata.faviconUrl ?? '')
+      setWebsiteMetadataPreviewImageUrl(metadata.previewImageUrl ?? '')
+      if (!metadata.title) setWebsiteMetadataError('No page title was found. CTRLSPACE will use the website domain instead.')
     }).catch((error: unknown) => {
       if (error instanceof DOMException && error.name === 'AbortError') return
-      console.error('Website title preview could not be loaded.', error)
-      setWebsiteMetadataError('Could not retrieve the website title. You can still add it using the website domain.')
+      if (requestVersion !== websiteMetadataRequestVersion.current) return
+      console.error('Website metadata preview could not be loaded.', error)
+      setWebsiteMetadataError('Could not retrieve website metadata. You can still add the URL and name it yourself.')
     })
   }
 
@@ -1333,7 +1618,7 @@ function App() {
         favorite: false,
       }
       saveApps([newApp, ...apps])
-      recordActivity('application', 'Imported GitHub repository', imported.fullName)
+      recordActivity('application', 'Imported GitHub repository', imported.fullName, newApp.id)
       setAppName('')
       setAppUrl('')
       setRepositoryUrl('')
@@ -1367,6 +1652,24 @@ function App() {
     setFormError('')
     const cleanUrlInput = appUrl.trim()
     const cleanRepositoryInput = repositoryUrl.trim()
+    let libraryMetadata: ReturnType<typeof createLibraryMetadata>
+    try {
+      libraryMetadata = createLibraryMetadata({
+        libraryFolder: appLibraryFolder,
+        tags: appTags,
+        owner: appOwner,
+        projectId: appProjectId,
+        lastUpdatedAt: appLastUpdatedAt,
+        lastDeployedAt: appLastDeployedAt,
+      })
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Check the library details and try again.')
+      return
+    }
+    if (libraryMetadata.projectId && !projects.some((project) => project.id === libraryMetadata.projectId)) {
+      setFormError('Choose a project that still exists, or clear the project link.')
+      return
+    }
     if (!cleanUrlInput && !cleanRepositoryInput && !directoryHandle) {
       setFormError('Add a website URL, Git repository, or local folder to continue.')
       return
@@ -1401,23 +1704,31 @@ function App() {
     if (isAddingApplication) return
     setIsAddingApplication(true)
     try {
-      let fetchedWebsiteTitle = ''
-      if (parsedUrl && !appName.trim()) {
-        if (websiteMetadataUrl === parsedUrl.toString()) {
-          fetchedWebsiteTitle = websiteMetadataTitle
+      let websiteMetadata: WebsiteMetadata = { title: null, faviconUrl: null, previewImageUrl: null }
+      if (parsedUrl) {
+        const normalizedUrl = parsedUrl.toString()
+        if (websiteMetadataUrl === normalizedUrl) {
+          websiteMetadata = {
+            title: websiteMetadataTitle || null,
+            faviconUrl: websiteMetadataFaviconUrl || null,
+            previewImageUrl: websiteMetadataPreviewImageUrl || null,
+          }
         } else {
           try {
-            fetchedWebsiteTitle = await lookupWebsiteTitle(parsedUrl.toString()) ?? ''
-            setWebsiteMetadataUrl(parsedUrl.toString())
-            setWebsiteMetadataTitle(fetchedWebsiteTitle)
-            if (!fetchedWebsiteTitle) setWebsiteMetadataError('No page title was found. CTRLSPACE will use the website domain instead.')
+            websiteMetadata = await lookupWebsiteMetadata(normalizedUrl)
+            setWebsiteMetadataUrl(normalizedUrl)
+            setWebsiteMetadataTitle(websiteMetadata.title ?? '')
+            setWebsiteMetadataFaviconUrl(websiteMetadata.faviconUrl ?? '')
+            setWebsiteMetadataPreviewImageUrl(websiteMetadata.previewImageUrl ?? '')
+            if (!websiteMetadata.title) setWebsiteMetadataError('No page title was found. CTRLSPACE will use the website domain instead.')
           } catch (error) {
             if (error instanceof DOMException && error.name === 'AbortError') return
-            console.error('Website title lookup failed while adding an application.', error)
-            setWebsiteMetadataError('Could not retrieve the website title. CTRLSPACE will use the website domain instead.')
+            console.error('Website metadata lookup failed while adding an application.', error)
+            setWebsiteMetadataError('Could not retrieve website metadata. The application will still be added without it.')
           }
         }
       }
+      const fetchedWebsiteTitle = websiteMetadata.title ?? ''
       const appId = crypto.randomUUID()
       if (directoryHandle) {
         try {
@@ -1447,33 +1758,53 @@ function App() {
         folderName: directoryHandle?.name ?? '',
         category: appCategory,
         collection: appCollection,
+        ...libraryMetadata,
+        websiteTitle: websiteMetadata.title ?? undefined,
+        faviconUrl: websiteMetadata.faviconUrl ?? undefined,
+        previewImageUrl: websiteMetadata.previewImageUrl ?? undefined,
         icon: displayName.charAt(0).toUpperCase(),
         tint: ['violet', 'blue', 'mint', 'orange'][apps.length % 4],
         status: 'unknown',
         favorite: false,
       }
       saveApps([newApp, ...apps])
-      recordActivity('application', 'Added application', displayName)
+      recordActivity('application', 'Added application', displayName, newApp.id)
       setAppName('')
       setAppUrl('')
       setWebsiteMetadataTitle('')
+      setWebsiteMetadataFaviconUrl('')
+      setWebsiteMetadataPreviewImageUrl('')
       setWebsiteMetadataUrl('')
       setWebsiteMetadataError('')
       setRepositoryUrl('')
       setDirectoryHandle(null)
       setAppCategory('Productivity')
       setAppCollection('')
+      setAppLibraryFolder('')
+      setAppTags('')
+      setAppOwner('')
+      setAppProjectId('')
+      setAppLastUpdatedAt('')
+      setAppLastDeployedAt('')
       setIsAddOpen(false)
     } finally {
       setIsAddingApplication(false)
     }
   }
 
+  function saveApplicationLibraryMetadata(appId: string, metadata: ReturnType<typeof createLibraryMetadata>) {
+    const app = apps.find((item) => item.id === appId)
+    if (!app) return
+    saveApps(apps.map((item) => item.id === appId ? { ...item, ...metadata } : item))
+    recordActivity('application', 'Updated library details', app.name, app.id)
+    setMetadataEditingAppId(null)
+  }
+
   function toggleFavorite(id: string) {
     const app = apps.find((item) => item.id === id)
     if (!app) return
     saveApps(apps.map((item) => item.id === id ? { ...item, favorite: !item.favorite } : item))
-    recordActivity('application', app.favorite ? 'Unpinned application' : 'Pinned application', app.name)
+    recordActivity('application', app.favorite ? 'Unpinned application' : 'Pinned application', app.name, app.id)
   }
 
   async function deleteApplication(id: string) {
@@ -1489,7 +1820,7 @@ function App() {
       }
     }
     saveApps(apps.filter((item) => item.id !== id))
-    recordActivity('application', 'Removed application', app.name)
+    recordActivity('application', 'Removed application', app.name, app.id)
   }
 
   async function browseLocalFolder(app: AppRecord) {
@@ -1532,7 +1863,7 @@ function App() {
   function recordAppLaunch(app: AppRecord, destination: 'website' | 'repository') {
     const lastOpenedAt = new Date().toISOString()
     saveApps(apps.map((item) => item.id === app.id ? { ...item, lastOpenedAt } : item))
-    recordActivity('application', `Opened ${destination}`, app.name)
+    recordActivity('application', `Opened ${destination}`, app.name, app.id)
   }
 
   async function signInWithGoogle() {
@@ -1660,6 +1991,21 @@ function App() {
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0)
   }
 
+  function downloadWorkspaceConflictBackup() {
+    if (!authUser) return
+    const backup = window.localStorage.getItem(workspaceStorageKey(authUser.id, 'ctrlspace.pending-workspace.v1'))
+    if (!backup) {
+      setWorkspaceBackupAvailable(false)
+      return
+    }
+    const objectUrl = URL.createObjectURL(new Blob([backup], { type: 'application/json' }))
+    const link = document.createElement('a')
+    link.href = objectUrl
+    link.download = `ctrlspace-local-conflict-backup-${localDateKey(new Date())}.json`
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0)
+  }
+
   const profileName = authUser
     ? typeof authUser.user_metadata.full_name === 'string' ? authUser.user_metadata.full_name : authUser.email ?? 'Signed-in user'
     : localDisplayName
@@ -1670,11 +2016,12 @@ function App() {
     'developer-portal': 'Developer Portal',
     'platform-admin': 'Platform Admin',
     applications: 'Applications',
+    'application-detail': activeApplication?.name ?? 'Application details',
     projects: 'Projects',
     activity: 'Activity',
     settings: 'Settings',
   }[currentView]
-  const activePortal = currentView === 'business-portal' || currentView === 'applications'
+  const activePortal = currentView === 'business-portal' || currentView === 'applications' || currentView === 'application-detail'
     ? 'Business'
     : currentView === 'developer-portal' || currentView === 'projects'
       ? 'Developer'
@@ -1728,7 +2075,11 @@ function App() {
   if (supabase && passwordRecovery && authUser) return <AuthGate mode="update-password" error={authError} message={authMessage} onUpdatePassword={updateRecoveredPassword} />
   if (supabase && authUser && authError) return <AuthGate error={authError} onSignOut={signOut} />
   if (supabase && !authUser) return <AuthGate error={authError} message={authMessage} onSignIn={signInWithGoogle} onEmailSignIn={signInWithEmail} onCreateAccount={createEmailAccount} onRecoverPassword={sendPasswordRecovery} />
-  if (supabase && authUser && workspaceOwnerId !== authUser.id) return <AuthGate loading />
+  if (supabase && authUser && workspaceSyncLoading) return <AuthGate loading loadingMessage="Loading your shared workspace…" />
+  if (supabase && authUser && workspaceSyncError && workspaceSyncReadyUserId !== authUser.id) {
+    return <AuthGate error={`${workspaceSyncError} Confirm the Supabase migration is applied, then refresh.`} onSignOut={signOut} />
+  }
+  if (supabase && authUser && workspaceSyncReadyUserId !== authUser.id) return <AuthGate loading loadingMessage="Preparing your shared workspace…" />
 
   return (
     <div className="app-shell">
@@ -1746,7 +2097,7 @@ function App() {
         <div className="nav-label">WORKSPACE</div>
         <nav className="main-nav" aria-label="Main navigation">
           {navItems.map((item) => (
-            <button key={item.id} className={`nav-item ${currentView === item.id ? 'active' : ''}`} onClick={() => setCurrentView(item.id)} aria-label={item.label} aria-current={currentView === item.id ? 'page' : undefined}>
+            <button key={item.id} className={`nav-item ${currentView === item.id || (item.id === 'applications' && currentView === 'application-detail') ? 'active' : ''}`} onClick={() => setCurrentView(item.id)} aria-label={item.label} aria-current={currentView === item.id || (item.id === 'applications' && currentView === 'application-detail') ? 'page' : undefined}>
               <Icon name={item.icon} size={17} />
               <span>{item.label}</span>
               {item.id === 'applications' && <span className="nav-count">{apps.length}</span>}
@@ -1881,6 +2232,8 @@ function App() {
         </header>
 
         <div className="page-content">
+          {workspaceBackupAvailable && <div className="workspace-sync-warning" role="status"><span>A different browser copy was preserved before loading the shared workspace.</span><button type="button" className="text-button" onClick={downloadWorkspaceConflictBackup}>Download preserved copy</button></div>}
+          {workspaceSyncError && <div className="workspace-sync-error" role="alert"><strong>Shared workspace sync stopped.</strong> {workspaceSyncError} Your browser copy is still stored locally; changes will not reach other devices until sync is restored.</div>}
           {currentView === 'business-portal' && (
             <>
               <section className="welcome-row compact-welcome">
@@ -1900,12 +2253,19 @@ function App() {
                   {apps.length ? <div className="portal-resource-list">{apps.slice(0, 6).map((app) => <div className="portal-resource-row" key={app.id}><span className="portal-resource-icon">{app.name.slice(0, 1).toUpperCase()}</span><span className="portal-resource-copy"><strong>{app.name}</strong><small>{app.url || app.category}</small></span><span className="portal-resource-state">{app.lastCheckedAt ? 'Checked' : 'Not checked'}</span></div>)}</div> : <p className="portal-empty">No resources yet. Add an app or website to start the inventory.</p>}
                 </section>
                 <section className="portal-panel">
-                  <div className="section-heading"><div><div className="section-kicker">DELIVERY OVERVIEW</div><h2>Project progress</h2></div><button className="text-button" onClick={() => setCurrentView('projects')}>View projects <Icon name="arrow" size={14} /></button></div>
-                  {projects.length ? <div className="portal-project-list">{projects.slice(0, 5).map((project) => {
-                    const done = project.tasks.filter((task) => task.status === 'done').length
-                    const progress = project.tasks.length ? Math.round(done / project.tasks.length * 100) : 0
-                    return <button className="portal-project-row" key={project.id} onClick={() => { setActiveProjectId(project.id); setCurrentView('projects') }}><span className="portal-project-copy"><strong>{project.name}</strong><small>{project.tasks.length} tasks · {project.bugs.filter((bug) => bug.status !== 'resolved').length} open bugs</small></span><span className="portal-progress"><span><i style={{ width: `${progress}%` }} /></span><small>{progress}%</small></span></button>
-                  })}</div> : <p className="portal-empty">No projects yet. Create one to track delivery progress.</p>}
+                  <div className="section-heading"><div><div className="section-kicker">DELIVERY OVERVIEW</div><h2>Project progress</h2></div><button className="text-button" onClick={() => setCurrentView('projects')}>View all projects <Icon name="arrow" size={14} /></button></div>
+                  {projects.length ? groupProjectsByTeam(projects).map((group) => (
+                    <div className="portal-team-section" key={group.team || 'unfiled'}>
+                      <div className="portal-team-label">{group.team || 'Unfiled projects'}</div>
+                      <div className="portal-project-list">
+                        {group.projects.map((project) => {
+                          const done = project.tasks.filter((task) => task.status === 'done').length
+                          const progress = project.tasks.length ? Math.round(done / project.tasks.length * 100) : 0
+                          return <button className="portal-project-row" key={project.id} onClick={() => { setActiveProjectId(project.id); setCurrentView('projects') }}><span className="portal-project-copy"><strong>{project.name}</strong>{project.team && <span className="portal-project-team"> · {project.team}</span>}<small>{project.tasks.length} tasks · {project.bugs.filter((bug) => bug.status !== 'resolved').length} open bugs</small></span><span className="portal-progress"><span><i style={{ width: `${progress}%` }} /></span><small>{progress}%</small></span></button>
+                        })}
+                      </div>
+                    </div>
+                  )) : <p className="portal-empty">No projects yet. Create one to track delivery progress.</p>}
                 </section>
               </div>
               <section className="portal-capabilities">
@@ -2107,7 +2467,7 @@ function App() {
                   </div>
                 </div>
                 <div className="app-grid">
-                  {apps.slice(0, 4).map((app) => <ApplicationCard key={app.id} app={app} collections={collectionOptions} onFavorite={toggleFavorite} onCollectionChange={assignCollection} onLaunch={recordAppLaunch} onOpenFolder={browseLocalFolder} onDelete={deleteApplication} onCheck={checkApplication} isChecking={checkingAppId === app.id} isCheckPending={Boolean(checkingAppId)} checkError={checkError?.appId === app.id ? checkError.message : ''} />)}
+                  {apps.slice(0, 4).map((app) => <ApplicationCard key={app.id} app={app} collections={collectionOptions} projects={projects} onFavorite={toggleFavorite} onCollectionChange={assignCollection} onLaunch={recordAppLaunch} onOpenFolder={browseLocalFolder} onDelete={deleteApplication} onCheck={checkApplication} isChecking={checkingAppId === app.id} isCheckPending={Boolean(checkingAppId)} checkError={checkError?.appId === app.id ? checkError.message : ''} />)}
                   <button className="add-card" onClick={() => setIsAddOpen(true)}><span className="add-card-icon"><Icon name="plus" size={19} /></span><strong>Add an application</strong><span>Bring your tools together</span></button>
                 </div>
               </section>
@@ -2146,9 +2506,37 @@ function App() {
                   </div>
                 </div>
               </div>
-              {filteredApps.length > 0 ? <div className={`app-grid library-grid ${layout === 'list' ? 'list-layout' : ''}`}>{filteredApps.map((app) => <ApplicationCard key={app.id} app={app} collections={collectionOptions} onFavorite={toggleFavorite} onCollectionChange={assignCollection} onLaunch={recordAppLaunch} onOpenFolder={browseLocalFolder} onDelete={deleteApplication} onCheck={checkApplication} isChecking={checkingAppId === app.id} isCheckPending={Boolean(checkingAppId)} checkError={checkError?.appId === app.id ? checkError.message : ''} />)}</div> : <div className="empty-state"><span><Icon name="search" size={22} /></span><h3>No applications found</h3><p>Try another search or add a new application to your library.</p><button className="primary-button" onClick={() => setIsAddOpen(true)}><Icon name="plus" size={16} /> Add application</button></div>}
+              <section className="library-advanced-filters" aria-label="Additional application filters">
+                <label><span>Status</span><select value={libraryStatusFilter} onChange={(event) => setLibraryStatusFilter(event.target.value)} aria-label="Filter by health status"><option value="all">Any status</option><option value="online">Online</option><option value="offline">Offline</option><option value="degraded">Degraded</option><option value="unknown">Not checked</option></select></label>
+                <label><span>Tag</span><select value={libraryTagFilter} onChange={(event) => setLibraryTagFilter(event.target.value)} aria-label="Filter by tag"><option value="all">All tags</option>{libraryTags.map((tag) => <option key={tag} value={tag}>{tag}</option>)}</select></label>
+                <label><span>Library folder</span><select value={libraryFolderFilter} onChange={(event) => setLibraryFolderFilter(event.target.value)} aria-label="Filter by library folder"><option value="all">All folders</option>{libraryFolders.map((folder) => <option key={folder} value={folder}>{folder}</option>)}</select></label>
+                <label><span>Project</span><select value={libraryProjectFilter} onChange={(event) => setLibraryProjectFilter(event.target.value)} aria-label="Filter by project"><option value="all">All projects</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+                <label><span>Owner</span><select value={libraryOwnerFilter} onChange={(event) => setLibraryOwnerFilter(event.target.value)} aria-label="Filter by owner"><option value="all">All owners</option>{libraryOwners.map((owner) => <option key={owner} value={owner}>{owner}</option>)}</select></label>
+                <label><span>Maintenance</span><select value={libraryMaintenanceFilter} onChange={(event) => setLibraryMaintenanceFilter(event.target.value)} aria-label="Filter by maintenance date"><option value="all">Any date</option><option value="recent-30">Updated in 30 days</option><option value="recent-90">Updated in 90 days</option><option value="recent-180">Updated in 180 days</option><option value="inactive">Inactive over 90 days</option><option value="unknown">No date recorded</option></select></label>
+                {hasLibraryFilters && <button className="text-button clear-library-filters" onClick={resetLibraryFilters}>Clear filters</button>}
+              </section>
+              {filteredApps.length > 0 ? <div className={`app-grid library-grid ${layout === 'list' ? 'list-layout' : ''}`}>{filteredApps.map((app) => <ApplicationCard key={app.id} app={app} collections={collectionOptions} projects={projects} onFavorite={toggleFavorite} onCollectionChange={assignCollection} onLaunch={recordAppLaunch} onOpenFolder={browseLocalFolder} onDelete={deleteApplication} onCheck={checkApplication} onEdit={(application) => setMetadataEditingAppId(application.id)} onDetails={(application) => { setSelectedApplicationId(application.id); setCurrentView('application-detail') }} isChecking={checkingAppId === app.id} isCheckPending={Boolean(checkingAppId)} checkError={checkError?.appId === app.id ? checkError.message : ''} />)}</div> : <div className="empty-state"><span><Icon name="search" size={22} /></span><h3>No applications found</h3><p>Try another search or add a new application to your library.</p><button className="primary-button" onClick={() => setIsAddOpen(true)}><Icon name="plus" size={16} /> Add application</button></div>}
               <footer className="page-footer"><span>{filteredApps.length} OF {apps.length} APPLICATIONS</span><span>Local workspace · Integrations not connected</span></footer>
             </>
+          )}
+
+          {currentView === 'application-detail' && (
+            activeApplication ? (
+              <ApplicationManagementPage
+                app={activeApplication}
+                project={linkedApplicationProject}
+                activities={applicationActivities}
+                checking={checkingAppId === activeApplication.id}
+                checkPending={Boolean(checkingAppId)}
+                checkError={checkError?.appId === activeApplication.id ? checkError.message : ''}
+                onBack={() => { setSelectedApplicationId(null); setCurrentView('applications') }}
+                onEdit={() => setMetadataEditingAppId(activeApplication.id)}
+                onCheck={() => { void checkApplication(activeApplication) }}
+                onOpenProject={linkedApplicationProject ? () => { setActiveProjectId(linkedApplicationProject.id); setCurrentView('projects') } : undefined}
+              />
+            ) : (
+              <div className="empty-state application-detail-missing"><span><Icon name="search" size={22} /></span><h3>Application not found</h3><p>It may have been removed from this workspace.</p><button className="primary-button" onClick={() => { setSelectedApplicationId(null); setCurrentView('applications') }}>Back to applications</button></div>
+            )
           )}
 
           {currentView === 'projects' && (
@@ -2300,6 +2688,13 @@ function App() {
         </div>
       </main>
 
+      {metadataEditingApp && <ApplicationMetadataDialog
+        app={metadataEditingApp}
+        projects={projects}
+        onClose={() => setMetadataEditingAppId(null)}
+        onSave={(metadata) => saveApplicationLibraryMetadata(metadataEditingApp.id, metadata)}
+      />}
+
       {isAddOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsAddOpen(false) }}>
           <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
@@ -2342,15 +2737,22 @@ function App() {
               <label className="form-label" htmlFor="app-url">Website URL <span>OPTIONAL</span></label>
               <input id="app-url" className="form-input" type="url" placeholder="https://example.com" value={appUrl} onChange={(event) => {
                 websiteMetadataLookup.current?.controller.abort()
+                websiteMetadataRequestVersion.current += 1
                 websiteMetadataLookup.current = null
                 setWebsiteMetadataLoading(false)
                 setWebsiteMetadataTitle('')
+                setWebsiteMetadataFaviconUrl('')
+                setWebsiteMetadataPreviewImageUrl('')
                 setWebsiteMetadataUrl('')
                 setWebsiteMetadataError('')
                 setAppUrl(event.target.value)
-              }} onBlur={(event) => previewWebsiteTitle(event.target.value)} />
-              {websiteMetadataLoading && <p className="metadata-hint">Looking up the website title…</p>}
+              }} onBlur={(event) => previewWebsiteMetadata(event.target.value)} />
+              {websiteMetadataLoading && <p className="metadata-hint">Looking up website details…</p>}
               {!websiteMetadataLoading && websiteMetadataTitle && <p className="metadata-hint">Website title found: {websiteMetadataTitle}</p>}
+              {!websiteMetadataLoading && websiteMetadataPreviewImageUrl && <div className="website-metadata-preview">
+                <img src={websiteAssetProxyUrl(websiteMetadataPreviewImageUrl, 'preview')} alt="Website preview" onError={(event) => { event.currentTarget.hidden = true }} />
+                <span>Preview image found</span>
+              </div>}
               {!websiteMetadataLoading && websiteMetadataError && <p className="metadata-error">{websiteMetadataError}</p>}
               <label className="form-label" htmlFor="repository-url">Git repository URL <span>OPTIONAL</span></label>
               <input id="repository-url" className="form-input" type="url" placeholder="https://github.com/company/project" value={repositoryUrl} onChange={(event) => setRepositoryUrl(event.target.value)} />
@@ -2373,6 +2775,16 @@ function App() {
                 <option value="">Unfiled</option>
                 {collections.map((item) => <option key={item}>{item}</option>)}
               </select>
+              <ApplicationMetadataFields
+                idPrefix="new-app"
+                libraryFolder={appLibraryFolder} onLibraryFolderChange={setAppLibraryFolder}
+                tags={appTags} onTagsChange={setAppTags}
+                owner={appOwner} onOwnerChange={setAppOwner}
+                projectId={appProjectId} onProjectIdChange={setAppProjectId}
+                lastUpdatedAt={appLastUpdatedAt} onLastUpdatedAtChange={setAppLastUpdatedAt}
+                lastDeployedAt={appLastDeployedAt} onLastDeployedAtChange={setAppLastDeployedAt}
+                projects={projects}
+              />
               {formError && <p className="form-error" role="alert">{formError}</p>}
               <div className="modal-actions"><button type="button" className="outline-button" onClick={() => setIsAddOpen(false)}>Cancel</button><button type="submit" className="primary-button" disabled={isAddingApplication}><Icon name="plus" size={16} /> {isAddingApplication ? 'Adding…' : 'Add to library'}</button></div>
             </form>
@@ -2413,6 +2825,15 @@ function App() {
               <input id="project-name" className="form-input" type="text" value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="e.g. Website refresh" maxLength={60} required />
               <label className="form-label" htmlFor="project-description">Description <span>OPTIONAL</span></label>
               <textarea id="project-description" className="form-input project-description-input" value={projectDescription} onChange={(event) => setProjectDescription(event.target.value)} placeholder="What is this project working toward?" maxLength={240} />
+              <label className="form-label" htmlFor="project-team">Team / department <span>OPTIONAL</span></label>
+              <input id="project-team" className="form-input" list="project-team-options" value={projectTeam} onChange={(event) => setProjectTeam(event.target.value)} placeholder="e.g. Engineering" maxLength={80} />
+              <datalist id="project-team-options">
+                <option>Engineering</option>
+                <option>Design</option>
+                <option>Product</option>
+                <option>Research</option>
+                <option>Operations</option>
+              </datalist>
               {projectError && <p className="form-error" role="alert">{projectError}</p>}
               <div className="modal-actions"><button type="button" className="outline-button" onClick={() => setIsProjectOpen(false)}>Cancel</button><button type="submit" className="primary-button"><Icon name="plus" size={16} /> Create project</button></div>
             </form>
@@ -2535,8 +2956,9 @@ function Metric({ icon, label, value, trend, tone }: { icon: string; label: stri
   return <article className="metric-card"><div className={`metric-icon ${tone}`}><Icon name={icon} size={17} /></div><div className="metric-label">{label}</div><div className="metric-bottom"><strong>{value}</strong><span>{trend}</span></div></article>
 }
 
-function AuthGate({ loading = false, error = '', message = '', mode = 'sign-in', onSignIn, onEmailSignIn, onCreateAccount, onRecoverPassword, onUpdatePassword, onSignOut }: {
+function AuthGate({ loading = false, loadingMessage = 'Checking your secure session…', error = '', message = '', mode = 'sign-in', onSignIn, onEmailSignIn, onCreateAccount, onRecoverPassword, onUpdatePassword, onSignOut }: {
   loading?: boolean
+  loadingMessage?: string
   error?: string
   message?: string
   mode?: 'sign-in' | 'update-password'
@@ -2597,7 +3019,7 @@ function AuthGate({ loading = false, error = '', message = '', mode = 'sign-in',
               ? 'We will email you a secure link to reset your password.'
               : 'Sign in with your email address or Google account to open your personal workspace.'}</p>
         {loading
-          ? <p className="auth-loading" role="status">Checking your secure session…</p>
+          ? <p className="auth-loading" role="status">{loadingMessage}</p>
           : (formError || error) && <p className="form-error auth-error" role="alert">{formError || error}</p>}
         {message && <p className="auth-message" role="status">{message}</p>}
         {(onEmailSignIn || onCreateAccount || onRecoverPassword || onUpdatePassword) && !loading && (
@@ -2641,24 +3063,124 @@ function AuthGate({ loading = false, error = '', message = '', mode = 'sign-in',
   )
 }
 
-function ApplicationCard({ app, collections, onFavorite, onCollectionChange, onLaunch, onOpenFolder, onDelete, onCheck, isChecking, isCheckPending, checkError }: {
+type ApplicationMetadataFieldsProps = {
+  idPrefix: string
+  libraryFolder: string
+  onLibraryFolderChange: (value: string) => void
+  tags: string
+  onTagsChange: (value: string) => void
+  owner: string
+  onOwnerChange: (value: string) => void
+  projectId: string
+  onProjectIdChange: (value: string) => void
+  lastUpdatedAt: string
+  onLastUpdatedAtChange: (value: string) => void
+  lastDeployedAt: string
+  onLastDeployedAtChange: (value: string) => void
+  projects: Project[]
+}
+
+function ApplicationMetadataFields({ idPrefix, libraryFolder, onLibraryFolderChange, tags, onTagsChange, owner, onOwnerChange, projectId, onProjectIdChange, lastUpdatedAt, onLastUpdatedAtChange, lastDeployedAt, onLastDeployedAtChange, projects }: ApplicationMetadataFieldsProps) {
+  return (
+    <div className="library-metadata-fields">
+      <div className="library-metadata-heading"><strong>Library details</strong><span>OPTIONAL · DATES ARE MANUAL</span></div>
+      <label className="form-label" htmlFor={`${idPrefix}-folder`}>Library folder path</label>
+      <input id={`${idPrefix}-folder`} className="form-input" type="text" value={libraryFolder} onChange={(event) => onLibraryFolderChange(event.target.value)} placeholder="Products / Research" maxLength={180} />
+      <label className="form-label" htmlFor={`${idPrefix}-tags`}>Tags <span>COMMA-SEPARATED · UP TO 20</span></label>
+      <input id={`${idPrefix}-tags`} className="form-input" type="text" value={tags} onChange={(event) => onTagsChange(event.target.value)} placeholder="customer-facing, internal" />
+      <label className="form-label" htmlFor={`${idPrefix}-owner`}>Owner <span>OPTIONAL</span></label>
+      <input id={`${idPrefix}-owner`} className="form-input" type="text" value={owner} onChange={(event) => onOwnerChange(event.target.value)} placeholder="Team or person" maxLength={80} />
+      <label className="form-label" htmlFor={`${idPrefix}-project`}>Related project <span>OPTIONAL</span></label>
+      <select id={`${idPrefix}-project`} className="form-input" value={projectId} onChange={(event) => onProjectIdChange(event.target.value)}><option value="">No project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>
+      <div className="library-date-fields">
+        <label className="form-label" htmlFor={`${idPrefix}-updated`}>Last updated <span>MANUAL</span><input id={`${idPrefix}-updated`} className="form-input" type="date" value={lastUpdatedAt} onChange={(event) => onLastUpdatedAtChange(event.target.value)} /></label>
+        <label className="form-label" htmlFor={`${idPrefix}-deployed`}>Last deployed <span>MANUAL</span><input id={`${idPrefix}-deployed`} className="form-input" type="date" value={lastDeployedAt} onChange={(event) => onLastDeployedAtChange(event.target.value)} /></label>
+      </div>
+      <p className="library-metadata-note">Owner and maintenance dates are your notes; CTRLSPACE does not retrieve them from billing, Git or deployment services.</p>
+    </div>
+  )
+}
+
+function ApplicationMetadataDialog({ app, projects, onClose, onSave }: {
+  app: AppRecord
+  projects: Project[]
+  onClose: () => void
+  onSave: (metadata: ReturnType<typeof createLibraryMetadata>) => void
+}) {
+  const [libraryFolder, setLibraryFolder] = useState(app.libraryFolder ?? '')
+  const [tags, setTags] = useState((app.tags ?? []).join(', '))
+  const [owner, setOwner] = useState(app.owner ?? '')
+  const [projectId, setProjectId] = useState(app.projectId ?? '')
+  const [lastUpdatedAt, setLastUpdatedAt] = useState(app.lastUpdatedAt ?? '')
+  const [lastDeployedAt, setLastDeployedAt] = useState(app.lastDeployedAt ?? '')
+  const [error, setError] = useState('')
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setError('')
+    try {
+      const metadata = createLibraryMetadata({ libraryFolder, tags, owner, projectId, lastUpdatedAt, lastDeployedAt })
+      if (metadata.projectId && !projects.some((project) => project.id === metadata.projectId)) {
+        throw new Error('Choose a project that still exists, or clear the project link.')
+      }
+      onSave(metadata)
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Check the library details and try again.')
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <section className="modal-card library-metadata-dialog" role="dialog" aria-modal="true" aria-labelledby="library-metadata-title">
+        <div className="modal-heading"><div><div className="section-kicker">APPLICATION LIBRARY</div><h2 id="library-metadata-title">Edit {app.name}</h2></div><button className="icon-button" onClick={onClose} aria-label="Close dialog"><Icon name="close" size={19} /></button></div>
+        <p className="modal-intro">Organize this application with tags, a library path, an owner, and optional project and maintenance notes.</p>
+        <form onSubmit={submit}>
+          <ApplicationMetadataFields
+            idPrefix={`edit-${app.id}`}
+            libraryFolder={libraryFolder} onLibraryFolderChange={setLibraryFolder}
+            tags={tags} onTagsChange={setTags}
+            owner={owner} onOwnerChange={setOwner}
+            projectId={projectId} onProjectIdChange={setProjectId}
+            lastUpdatedAt={lastUpdatedAt} onLastUpdatedAtChange={setLastUpdatedAt}
+            lastDeployedAt={lastDeployedAt} onLastDeployedAtChange={setLastDeployedAt}
+            projects={projects}
+          />
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="modal-actions"><button type="button" className="outline-button" onClick={onClose}>Cancel</button><button type="submit" className="primary-button"><Icon name="check" size={16} /> Save library details</button></div>
+        </form>
+      </section>
+    </div>
+  )
+}
+
+function ApplicationCard({ app, collections, projects, onFavorite, onCollectionChange, onLaunch, onOpenFolder, onDelete, onCheck, onEdit, onDetails, isChecking, isCheckPending, checkError }: {
   app: AppRecord
   collections: string[]
+  projects: Project[]
   onFavorite: (id: string) => void
   onCollectionChange: (id: string, collection: string) => void
   onLaunch: (app: AppRecord, destination: 'website' | 'repository') => void
   onOpenFolder: (app: AppRecord) => void
   onDelete: (id: string) => void
   onCheck: (app: AppRecord) => void
+  onEdit?: (app: AppRecord) => void
+  onDetails?: (app: AppRecord) => void
   isChecking: boolean
   isCheckPending: boolean
   checkError: string
 }) {
-  const [faviconAvailable, setFaviconAvailable] = useState(Boolean(app.url))
-  const faviconUrl = app.url ? `${new URL(app.url).origin}/favicon.ico` : ''
+  const [faviconAvailable, setFaviconAvailable] = useState(Boolean(app.faviconUrl || app.url))
+  const [previewAvailable, setPreviewAvailable] = useState(Boolean(app.previewImageUrl))
+  const fallbackFaviconUrl = app.url ? `${new URL(app.url).origin}/favicon.ico` : ''
+  const faviconUrl = app.faviconUrl
+    ? websiteAssetProxyUrl(app.faviconUrl, 'icon')
+    : fallbackFaviconUrl
 
   return (
     <article className="application-card">
+      {previewAvailable && app.previewImageUrl && <div className="application-preview-image">
+        <img src={websiteAssetProxyUrl(app.previewImageUrl, 'preview')} alt="" onError={() => setPreviewAvailable(false)} />
+      </div>}
       <div className="application-card-top">
         <div className={`application-icon ${app.tint}`}>
           {faviconAvailable ? <img src={faviconUrl} alt="" onError={() => setFaviconAvailable(false)} /> : app.icon}
@@ -2667,11 +3189,22 @@ function ApplicationCard({ app, collections, onFavorite, onCollectionChange, onL
           <select className="application-collection-select" value={app.collection || 'Unfiled'} onChange={(event) => onCollectionChange(app.id, event.target.value)} aria-label={`Move ${app.name} to a collection`}>
             {collections.map((collection) => <option key={collection}>{collection}</option>)}
           </select>
+          {onEdit && <button className="application-metadata-edit-button" onClick={() => onEdit(app)} aria-label={`Edit library details for ${app.name}`} title="Edit library details"><Icon name="settings" size={15} /></button>}
           <button className={`favorite-button ${app.favorite ? 'is-favorite' : ''}`} onClick={() => onFavorite(app.id)} aria-label={app.favorite ? `Unpin ${app.name}` : `Pin ${app.name}`}><Icon name="star" size={16} /></button>
         </div>
       </div>
-      <div className="application-title-row"><h3>{app.name}</h3><span className={`tiny-status ${app.status}`} title={app.statusDetail || (app.status === 'unknown' ? 'Not checked yet' : app.status)} /></div>
+      <div className="application-title-row"><h3 title={app.websiteTitle || app.name}>{app.name}</h3><span className={`tiny-status ${app.status}`} title={app.statusDetail || (app.status === 'unknown' ? 'Not checked yet' : app.status)} /></div>
       <div className="application-meta"><span>{app.category}</span><span className="meta-separator">·</span><span title={app.repositoryDescription}>{app.url ? new URL(app.url).hostname : app.repositoryFullName || (app.repositoryUrl ? new URL(app.repositoryUrl).hostname : app.folderName || 'No source connected')}</span></div>
+      {(app.libraryFolder || app.owner || app.projectId || (app.tags?.length ?? 0) > 0 || app.lastUpdatedAt || app.lastDeployedAt || isInactiveApplication(app)) && <div className="application-library-details">
+        {app.libraryFolder && <span className="library-detail-path" title="Library folder">{app.libraryFolder}</span>}
+        {app.owner && <span>Owner: {app.owner}</span>}
+        {app.projectId && <span>Project: {projects.find((project) => project.id === app.projectId)?.name ?? 'Unlinked project'}</span>}
+        {app.tags?.map((tag) => <span className="library-tag-chip" key={tag}>{tag}</span>)}
+        {app.lastUpdatedAt && <span>Updated {app.lastUpdatedAt}</span>}
+        {app.lastDeployedAt && <span>Deployed {app.lastDeployedAt}</span>}
+        {isInactiveApplication(app) && <span className="inactive-application-badge">Inactive &gt;90 days</span>}
+      </div>}
+      {onDetails && <button type="button" className="application-details-button" onClick={() => onDetails(app)} aria-label={`View details for ${app.name}`}>View details <Icon name="arrow" size={13} /></button>}
       <div className="application-card-footer">
         <span className={`app-status-text ${app.status}`} title={app.lastCheckedAt ? `Last checked ${new Date(app.lastCheckedAt).toLocaleString()}` : undefined}>
           {app.status === 'unknown' ? 'NOT CHECKED' : app.status.toUpperCase()}{app.responseTimeMs !== undefined ? ` · ${app.responseTimeMs} MS` : ''}
@@ -2688,6 +3221,111 @@ function ApplicationCard({ app, collections, onFavorite, onCollectionChange, onL
       {checkError && <p className="status-check-error" role="alert">{checkError}</p>}
       {app.lastCheckedAt && <time className="status-checked-at" dateTime={app.lastCheckedAt}>Checked {formatActivityTime(app.lastCheckedAt)} · {app.statusDetail}</time>}
     </article>
+  )
+}
+
+function ApplicationManagementPage({ app, project, activities, checking, checkPending, checkError, onBack, onEdit, onCheck, onOpenProject }: {
+  app: AppRecord
+  project: Project | null
+  activities: WorkspaceActivity[]
+  checking: boolean
+  checkPending: boolean
+  checkError: string
+  onBack: () => void
+  onEdit: () => void
+  onCheck: () => void
+  onOpenProject?: () => void
+}) {
+  const unavailableConnections = [
+    { title: 'Deployment environments', detail: app.lastDeployedAt ? `Last-deployed date ${app.lastDeployedAt} is manually maintained; no environment history is connected.` : 'No deployment provider or environment history is connected.' },
+    { title: 'Team members', detail: app.owner ? `“${app.owner}” is a free-text owner label, not an account-linked team member.` : 'No team directory or application membership is connected.' },
+    { title: 'Documents', detail: 'No application document store or sharing integration is connected.' },
+    { title: 'Subscriptions', detail: 'No billing source is connected, so subscription and usage data are unavailable.' },
+  ]
+
+  return (
+    <>
+      <section className="welcome-row compact-welcome application-detail-header">
+        <div className="application-detail-heading">
+          <button type="button" className="text-button application-detail-back" onClick={onBack}><Icon name="chevron" size={14} /> Back to library</button>
+          <div className="eyebrow"><span className="eyebrow-line" /> APPLICATION MANAGEMENT</div>
+          <h1>{app.name}</h1>
+          <p className="welcome-subtitle">{app.websiteTitle || app.repositoryDescription || 'Application details and connected workspace data.'}</p>
+        </div>
+        <div className="application-detail-actions">
+          {app.url && <button type="button" className="monitor-check-button" onClick={onCheck} disabled={checkPending} aria-label={checking ? `Checking ${app.name}` : `Check status of ${app.name}`}><Icon name="pulse" size={14} /> {checking ? 'Checking…' : 'Check status'}</button>}
+          <button type="button" className="outline-button" onClick={onEdit}><Icon name="settings" size={15} /> Edit library details</button>
+          {app.repositoryUrl && <a className="outline-button" href={app.repositoryUrl} target="_blank" rel="noreferrer"><Icon name="layers" size={15} /> Open repository</a>}
+          {app.url && <a className="primary-button" href={app.url} target="_blank" rel="noreferrer"><Icon name="external" size={15} /> Open website</a>}
+        </div>
+      </section>
+
+      <div className="application-detail-grid">
+        <section className="panel application-detail-panel" aria-labelledby="application-info-heading">
+          <div className="section-heading"><div><div className="section-kicker">RESOURCE PROFILE</div><h2 id="application-info-heading">Application information</h2></div></div>
+          <dl className="application-detail-fields">
+            <div><dt>Category</dt><dd>{app.category || 'Not set'}</dd></div>
+            <div><dt>Collection</dt><dd>{app.collection || 'Unfiled'}</dd></div>
+            <div><dt>Library folder</dt><dd>{app.libraryFolder || 'Not set'}</dd></div>
+            <div><dt>Owner label</dt><dd>{app.owner || 'Not set'}{app.owner && <small>Free-text label; not a team assignment.</small>}</dd></div>
+            <div><dt>Tags</dt><dd className="application-detail-tags">{app.tags?.length ? app.tags.map((tag) => <span className="library-tag-chip" key={tag}>{tag}</span>) : 'None'}</dd></div>
+            <div><dt>Last updated</dt><dd>{app.lastUpdatedAt || 'Not recorded'}{app.lastUpdatedAt && <small>Manually maintained date.</small>}</dd></div>
+            <div><dt>Last deployed</dt><dd>{app.lastDeployedAt || 'Not recorded'}{app.lastDeployedAt && <small>Manually maintained date; not deployment history.</small>}</dd></div>
+          </dl>
+        </section>
+
+        <section className="panel application-detail-panel" aria-labelledby="application-sources-heading">
+          <div className="section-heading"><div><div className="section-kicker">CONNECTED RESOURCES</div><h2 id="application-sources-heading">Website &amp; repository</h2></div></div>
+          <div className="application-detail-source-list">
+            {app.url
+              ? <a className="application-detail-source" href={app.url} target="_blank" rel="noreferrer"><span><strong>{app.websiteTitle || 'Website'}</strong><small>{app.url}</small></span><Icon name="external" size={15} /></a>
+              : <p className="application-detail-empty">No website URL is linked.</p>}
+            {app.repositoryUrl
+              ? <a className="application-detail-source" href={app.repositoryUrl} target="_blank" rel="noreferrer"><span><strong>{app.repositoryFullName || 'Repository'}</strong><small>{app.repositoryDescription || app.repositoryUrl}</small>{app.repositoryDefaultBranch && <small>Default branch: {app.repositoryDefaultBranch}{app.repositoryPrivate === null ? '' : app.repositoryPrivate ? ' · Private' : ' · Public'}</small>}</span><Icon name="external" size={15} /></a>
+              : <p className="application-detail-empty">No repository is linked.</p>}
+            {app.folderName && <div className="application-detail-source application-detail-folder"><span><strong>Device folder link</strong><small>{app.folderName} · stored in this browser</small></span><Icon name="folder" size={15} /></div>}
+          </div>
+        </section>
+
+        <section className="panel application-detail-panel" aria-labelledby="application-health-heading">
+          <div className="section-heading"><div><div className="section-kicker">MANUAL WEBSITE CHECK</div><h2 id="application-health-heading">Latest health result</h2></div></div>
+          <div className={`application-detail-health ${app.status}`}><span className="application-detail-health-dot" /><strong>{app.lastCheckedAt ? app.status.toUpperCase() : 'NOT CHECKED'}</strong>{app.responseTimeMs !== undefined && <span>{app.responseTimeMs} ms</span>}</div>
+          <p className="application-detail-health-copy">{app.statusDetail || (app.lastCheckedAt ? 'No additional check detail was saved.' : app.url ? 'Run a website check to record reachability and response time.' : 'A website URL is required for this manual reachability check.')}</p>
+          {checkError && <p className="status-check-error" role="alert">{checkError}</p>}
+          {app.lastCheckedAt && <time className="application-detail-timestamp" dateTime={app.lastCheckedAt}>Last checked {formatActivityTime(app.lastCheckedAt)}</time>}
+          <p className="application-detail-note">This is an on-demand public website check, not scheduled monitoring or an application-level health test.</p>
+        </section>
+
+        <section className="panel application-detail-panel application-project-panel" aria-labelledby="application-project-heading">
+          <div className="section-heading"><div><div className="section-kicker">RELATED PROJECT WORK</div><h2 id="application-project-heading">Tasks &amp; bugs</h2></div>{project && onOpenProject && <button type="button" className="text-button" onClick={onOpenProject}>Open project <Icon name="arrow" size={14} /></button>}</div>
+          {project ? <>
+            <p className="application-linked-project-name">Linked project: <strong>{project.name}</strong></p>
+            <div className="application-linked-work-grid">
+              <div className="application-linked-work-column"><h3>Tasks <span>{project.tasks.length}</span></h3>
+                {project.tasks.length ? <ul>{project.tasks.slice(0, 5).map((task) => <li key={task.id}><span><strong>{task.title}</strong><small>{task.priority} priority</small></span><em className={`linked-work-status ${task.status}`}>{task.status === 'in-progress' ? 'In progress' : task.status === 'done' ? 'Done' : 'To do'}</em></li>)}</ul> : <p className="application-detail-empty">No tasks in this project.</p>}
+                {project.tasks.length > 5 && <p className="application-detail-more">+ {project.tasks.length - 5} more in the project workspace</p>}
+              </div>
+              <div className="application-linked-work-column"><h3>Bugs <span>{project.bugs.length}</span></h3>
+                {project.bugs.length ? <ul>{project.bugs.slice(0, 5).map((bug) => <li key={bug.id}><span><strong>{bug.title}</strong><small>{bug.severity} severity</small></span><em className={`linked-work-status ${bug.status}`}>{bug.status === 'in-progress' ? 'In progress' : bug.status === 'resolved' ? 'Resolved' : 'Open'}</em></li>)}</ul> : <p className="application-detail-empty">No bugs in this project.</p>}
+                {project.bugs.length > 5 && <p className="application-detail-more">+ {project.bugs.length - 5} more in the project workspace</p>}
+              </div>
+            </div>
+          </> : <p className="application-detail-empty">{app.projectId ? 'The linked project is not available in this workspace.' : 'No project is linked to this application.'}</p>}
+        </section>
+
+        <section className="panel application-detail-panel application-connection-panel" aria-labelledby="application-connections-heading">
+          <div className="section-heading"><div><div className="section-kicker">INTEGRATION STATUS</div><h2 id="application-connections-heading">Other management data</h2></div></div>
+          <div className="application-connection-grid">{unavailableConnections.map((connection) => <article className="application-connection-state" key={connection.title}><span className="capability-status">NOT CONNECTED</span><strong>{connection.title}</strong><p>{connection.detail}</p></article>)}</div>
+        </section>
+
+        <section className="panel application-detail-panel application-activity-panel" aria-labelledby="application-activity-heading">
+          <div className="section-heading"><div><div className="section-kicker">CTRLSPACE EVENTS</div><h2 id="application-activity-heading">Application activity</h2></div></div>
+          {activities.length ? <div className="application-detail-activity-list">{activities.map((item) => <article className="application-detail-activity" key={item.id}><div className={`activity-icon ${activityColor(item.category)}`}><Icon name={activityIcon(item.category)} size={14} /></div><span><strong>{item.title}</strong><small>{item.detail}</small></span><time dateTime={item.createdAt}>{formatActivityTime(item.createdAt)}</time></article>)}</div> : <p className="application-detail-empty">No app-linked events yet. New application actions will appear here. Older generic activity remains in the global Activity view and is not attributed by name.</p>}
+          <p className="application-detail-note">Only explicitly linked events in the local activity log are shown; external Git, deployment, and monitoring events are not connected.</p>
+        </section>
+      </div>
+      <footer className="page-footer"><span>CTRLSPACE <span className="footer-divider">/</span> APPLICATION DETAILS</span><span>Workspace data · external integrations not connected</span></footer>
+    </>
   )
 }
 
@@ -2729,7 +3367,7 @@ function ProjectCard({ project, onOpen }: { project: Project; onOpen: () => void
   const initials = project.name.trim().split(/\s+/).slice(0, 2).map((word) => word[0]).join('').toUpperCase()
   return (
     <article className="project-card project-card-action">
-      <div className="project-card-header"><div className={`project-avatar ${project.color}`}>{initials}</div><span className="project-task-count">{project.tasks.length} {project.tasks.length === 1 ? 'task' : 'tasks'}</span></div>
+      <div className="project-card-header"><div className={`project-avatar ${project.color}`}>{initials}</div><span className="project-task-count">{project.tasks.length} {project.tasks.length === 1 ? 'task' : 'tasks'}</span>{project.team && <span className="project-team-badge">{project.team}</span>}</div>
       <div className="project-card-title"><h3>{project.name}</h3><span className="project-status"><i />{status}</span></div>
       <p className="project-description">{project.description || 'No description added.'}</p>
       <div className="progress-heading"><span>Project progress</span><strong>{projectProgress(project)}%</strong></div>

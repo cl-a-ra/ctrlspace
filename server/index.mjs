@@ -5,6 +5,7 @@ import { request as httpRequest, createServer } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { isIP } from 'node:net'
 import { extname, resolve, sep } from 'node:path'
+import { extractWebsiteMetadata, isSupportedPreviewContentType } from './website-metadata.mjs'
 
 function loadEnvironmentFile() {
   const file = resolve('.env')
@@ -168,6 +169,21 @@ function validateOrigin(request) {
   }
 }
 
+function validatePreviewRequest(request) {
+  const origin = request.headers.origin
+  if (origin) {
+    if (origin !== appBase.origin) throw new Error('This preview request did not come from the CTRLSPACE app.')
+    return
+  }
+  if (request.headers['sec-fetch-site'] === 'same-origin') return
+  try {
+    if (new URL(request.headers.referer).origin === appBase.origin) return
+  } catch {
+    // Requests without a same-origin browser signal are not allowed to proxy external images.
+  }
+  throw new Error('This preview request did not come from the CTRLSPACE app.')
+}
+
 async function readJsonBody(request) {
   const chunks = []
   let total = 0
@@ -236,32 +252,7 @@ function requestWebsite(target, address, { headers, method = 'GET' }) {
   })
 }
 
-function decodeHtmlText(value) {
-  return value.replace(/&#(x[0-9a-f]+|\d+);?|&(amp|lt|gt|quot|apos|nbsp);/gi, (entity, numeric, named) => {
-    if (numeric) {
-      const hex = numeric[0].toLowerCase() === 'x'
-      const code = Number.parseInt(hex ? numeric.slice(1) : numeric, hex ? 16 : 10)
-      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : ''
-    }
-    return ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' })[named.toLowerCase()]
-  }).replace(/\s+/g, ' ').trim()
-}
-
-function pageTitleFromHtml(html) {
-  const metaTags = html.match(/<meta\b[^>]*>/gi) ?? []
-  for (const tag of metaTags) {
-    const property = tag.match(/\b(?:property|name)\s*=\s*["'](?:og:title|twitter:title)["']/i)
-    if (!property) continue
-    const content = tag.match(/\bcontent\s*=\s*(["'])(.*?)\1/i)?.[2]
-    const title = content ? decodeHtmlText(content) : ''
-    if (title) return title.slice(0, 200)
-  }
-  const title = html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1]
-  const cleanTitle = title ? decodeHtmlText(title.replace(/<[^>]*>/g, '')) : ''
-  return cleanTitle ? cleanTitle.slice(0, 200) : null
-}
-
-async function fetchWebsiteTitle(inputUrl, redirectsRemaining = 3) {
+async function fetchWebsiteMetadata(inputUrl, redirectsRemaining = 3) {
   const target = new URL(inputUrl)
   const address = await publicIpv4Address(target)
   const response = await requestWebsite(target, address, {
@@ -272,7 +263,7 @@ async function fetchWebsiteTitle(inputUrl, redirectsRemaining = 3) {
     response.resume()
     if (redirectsRemaining === 0) throw new Error('The website redirected too many times.')
     const nextUrl = new URL(response.headers.location, target)
-    return fetchWebsiteTitle(nextUrl.toString(), redirectsRemaining - 1)
+    return fetchWebsiteMetadata(nextUrl.toString(), redirectsRemaining - 1)
   }
   if (status < 200 || status >= 300) {
     response.resume()
@@ -293,7 +284,54 @@ async function fetchWebsiteTitle(inputUrl, redirectsRemaining = 3) {
     }
     chunks.push(chunk)
   }
-  return pageTitleFromHtml(Buffer.concat(chunks).toString('utf8'))
+  return extractWebsiteMetadata(Buffer.concat(chunks).toString('utf8'), target.toString())
+}
+
+async function fetchWebsitePreview(inputUrl, kind = 'preview', redirectsRemaining = 3) {
+  const target = new URL(inputUrl)
+  const address = await publicIpv4Address(target)
+  const response = await requestWebsite(target, address, {
+    headers: {
+      Accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.9,*/*;q=0.1',
+      'User-Agent': 'CTRLSPACE website preview',
+    },
+  })
+  const status = response.statusCode ?? 0
+  if ([301, 302, 303, 307, 308].includes(status) && response.headers.location) {
+    response.resume()
+    if (redirectsRemaining === 0) throw new Error('The preview image redirected too many times.')
+    const nextUrl = new URL(response.headers.location, target)
+    return fetchWebsitePreview(nextUrl.toString(), kind, redirectsRemaining - 1)
+  }
+  if (status !== 200) {
+    response.resume()
+    throw new Error(`The preview image returned HTTP ${status}.`)
+  }
+  const contentType = response.headers['content-type']
+  const imageType = String(contentType ?? '').split(';', 1)[0].trim().toLowerCase()
+  const iconTypes = ['image/svg+xml', 'image/x-icon', 'image/vnd.microsoft.icon', 'image/bmp']
+  if (!isSupportedPreviewContentType(contentType) && !(kind === 'icon' && iconTypes.includes(imageType))) {
+    response.resume()
+    throw new Error('The preview URL did not return a supported image.')
+  }
+  const declaredLength = Number(response.headers['content-length'])
+  const maxLength = 2 * 1024 * 1024
+  if (Number.isFinite(declaredLength) && declaredLength > maxLength) {
+    response.resume()
+    throw new Error('The preview image is too large to display safely.')
+  }
+
+  const chunks = []
+  let length = 0
+  for await (const chunk of response) {
+    length += chunk.length
+    if (length > maxLength) {
+      response.destroy()
+      throw new Error('The preview image is too large to display safely.')
+    }
+    chunks.push(chunk)
+  }
+  return { contentType: contentType.split(';', 1)[0].trim().toLowerCase(), body: Buffer.concat(chunks) }
 }
 
 async function checkWebsite(inputUrl, redirectsRemaining = 3) {
@@ -394,11 +432,49 @@ async function handleApi(request, response, url) {
       return sendJson(response, 400, { error: 'Only http:// and https:// website addresses are supported.' })
     }
     try {
-      return sendJson(response, 200, { title: await fetchWebsiteTitle(parsedUrl.toString()) })
+      return sendJson(response, 200, await fetchWebsiteMetadata(parsedUrl.toString()))
     } catch (error) {
       console.error('Website metadata could not be retrieved.', error)
       return sendJson(response, 502, { error: error.message })
     }
+  }
+
+  if (request.method === 'GET' && url.pathname === '/api/website/preview') {
+    try {
+      validatePreviewRequest(request)
+    } catch (error) {
+      return sendJson(response, 403, { error: error.message })
+    }
+    const kind = url.searchParams.get('kind') ?? 'preview'
+    if (kind !== 'icon' && kind !== 'preview') return sendJson(response, 400, { error: 'Choose a valid website image type.' })
+    const inputUrl = url.searchParams.get('url') ?? ''
+    if (!inputUrl || inputUrl.length > 2048) return sendJson(response, 400, { error: 'Choose a valid preview image URL.' })
+    let parsedUrl
+    try {
+      parsedUrl = new URL(inputUrl)
+    } catch {
+      return sendJson(response, 400, { error: 'Choose a valid preview image URL.' })
+    }
+    if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+      return sendJson(response, 400, { error: 'Preview images must use http:// or https://.' })
+    }
+    try {
+      const image = await fetchWebsitePreview(parsedUrl.toString(), kind)
+      response.writeHead(200, {
+        'Content-Type': image.contentType,
+        'Content-Length': image.body.length,
+        'Cache-Control': 'private, max-age=300',
+        'Content-Security-Policy': "default-src 'none'; sandbox",
+        'Cross-Origin-Resource-Policy': 'same-origin',
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff',
+      })
+      response.end(image.body)
+    } catch (error) {
+      console.error('Website preview image could not be retrieved.', error)
+      return sendJson(response, 502, { error: error.message })
+    }
+    return
   }
 
   if (request.method === 'POST' && url.pathname === '/api/website/check') {
